@@ -498,6 +498,14 @@ API int nv_fluid_set_gpu(NvFluid *f, int on) {
   return f->gpu ? 1 : 0;
 }
 
+WEAK void nv_gpu_phases(void *fluid_gpu, double *out);
+/* GPU time per solver phase since the last call (ms): adv scalars, combust, adv velocity, forces, project, other */
+API int nv_fluid_gpu_phases(NvFluid *f, double *out) {
+  if (!f->gpu || !nv_gpu_phases) return 0;
+  nv_gpu_phases(f->gpu, out);
+  return 1;
+}
+
 /* GPU mode: copy the scalar fields (and velocities if asked) into the CPU arrays read by Python */
 API void nv_fluid_sync(NvFluid *f, int with_velocity) {
   if (!f->gpu) return;

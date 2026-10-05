@@ -1,7 +1,9 @@
 #version 450
 // Multigrid V-cycle pieces on one level (dims in n.xyz). n.w = op:
 //  0 x = 0                      o0 = (x, b, r, stencil)
-//  1 red/black Gauss-Seidel     o0 = (x, b, r, stencil), o1.x = colour
+//  1 red/black Gauss-Seidel     o0 = (x, b, r, stencil), o1.x = colour, o1.y = 1: x is zero (first sweep)
+//  5 residual fused into restriction: coarse b from fine x, b  o0 = (fine x, fine stencil, coarse b,
+//    coarse stencil), o1 = (fine nx, ny, nz, fine b)
 //  2 r = b - A x                o0 = (x, b, r, stencil)
 //  3 restrict to coarse b       o0 = (fine r, fine stencil, coarse b, coarse stencil), o1 = (fine nx, ny, nz, -)
 //  4 prolong: x += coarse x     o0 = (x, -, -, stencil), o1 = (coarse x, cnx, cny, -)
@@ -37,6 +39,7 @@ void main() {
     if (dg == 0u) return;
     uint X = pc.o0.x, sy = uint(nx), sz = uint(nx * ny);
     float s = F[pc.o0.y + c];
+    if (pc.o1.y != 0u) { F[X + c] = s / float(dg); return; }  /* first red sweep: all neighbours are 0 */
     if ((m & 1u) != 0u) s += F[X + c - 1u];
     if ((m & 2u) != 0u) s += F[X + c + 1u];
     if ((m & 4u) != 0u) s += F[X + c - sy];
@@ -57,6 +60,17 @@ void main() {
       if (i >= fx || j >= fy || k >= fz) continue;
       uint cf = uint(i + fx * (j + fy * k));
       if ((S[pc.o0.y + cf] & 255u) != 0u) s += F[pc.o0.x + cf];
+    }
+    F[pc.o0.z + c] = 0.5 * s;
+  } else if (op == 5) {
+    if ((S[pc.o0.w + c] & 255u) == 0u) { F[pc.o0.z + c] = 0.0; return; }
+    int fx = int(pc.o1.x), fy = int(pc.o1.y), fz = int(pc.o1.z);
+    float s = 0.0;
+    for (int q = 0; q < 8; q++) {
+      int i = 2 * g.x + (q & 1), j = 2 * g.y + ((q >> 1) & 1), k = 2 * g.z + ((q >> 2) & 1);
+      if (i >= fx || j >= fy || k >= fz) continue;
+      uint cf = uint(i + fx * (j + fy * k));
+      if ((S[pc.o0.y + cf] & 255u) != 0u) s += F[pc.o1.w + cf] - Ax(pc.o0.x, pc.o0.y, cf, fx, fy);
     }
     F[pc.o0.z + c] = 0.5 * s;
   } else if (op == 4) {

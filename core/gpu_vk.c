@@ -39,7 +39,8 @@
   X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCmdPipelineBarrier)          \
   X(vkCmdCopyBuffer) X(vkCmdFillBuffer) X(vkQueueSubmit) X(vkCreateFence) X(vkDestroyFence)          \
   X(vkWaitForFences) X(vkResetFences) X(vkResetCommandBuffer) X(vkDeviceWaitIdle)                    \
-  X(vkFreeDescriptorSets)
+  X(vkFreeDescriptorSets) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdWriteTimestamp)            \
+  X(vkCmdResetQueryPool) X(vkGetQueryPoolResults)
 
 static PFN_vkGetInstanceProcAddr vk_gipa;
 static PFN_vkCreateInstance vk_create_instance;
@@ -48,7 +49,7 @@ VK_FUNCS(DECL)
 #undef DECL
 
 /* pipelines, one per shader */
-#define SHADERS(X) X(adv_scalars) X(adv_face) X(combust) X(forces) X(faces) X(project) X(mg) X(cg) X(splat) X(tilemax)
+#define SHADERS(X) X(adv_scalars) X(adv_face) X(combust) X(forces) X(faces) X(project) X(mg) X(cg) X(splat) X(tilemax) X(mg_small)
 #define SH_ENUM(n) SH_##n,
 enum { SHADERS(SH_ENUM) SH_COUNT };
 
@@ -81,6 +82,8 @@ static struct {
   VkPipelineLayout pl;
   VkPipeline pipe[SH_COUNT];
   VkDescriptorPool dpool;
+  float ts_period; /* ns per timestamp tick */
+  int ts_ok;
 } G;
 
 static double now_ms(void) {
@@ -204,6 +207,7 @@ API int nv_gpu_init(void) {
   VkPhysicalDeviceProperties props;
   vkGetPhysicalDeviceProperties_(G.phys, &props);
   snprintf(G.name, sizeof G.name, "%s", props.deviceName);
+  G.ts_period = props.limits.timestampPeriod;
   vkGetPhysicalDeviceMemoryProperties_(G.phys, &G.memp);
   uint32_t nq = 0;
   vkGetPhysicalDeviceQueueFamilyProperties_(G.phys, &nq, NULL);
@@ -212,10 +216,14 @@ API int nv_gpu_init(void) {
   vkGetPhysicalDeviceQueueFamilyProperties_(G.phys, &nq, qf);
   G.qfam = UINT32_MAX;
   for (uint32_t i = 0; i < nq; i++)
+    if ((qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && !(qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
+        qf[i].timestampValidBits) { G.qfam = i; break; }
+  for (uint32_t i = 0; i < nq && G.qfam == UINT32_MAX; i++)
     if ((qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && !(qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) { G.qfam = i; break; }
   for (uint32_t i = 0; i < nq && G.qfam == UINT32_MAX; i++)
     if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) G.qfam = i;
   if (G.qfam == UINT32_MAX) return fail("no compute queue", VK_ERROR_FEATURE_NOT_PRESENT);
+  G.ts_ok = qf[G.qfam].timestampValidBits > 0 && G.ts_period > 0.f;
   float prio = 1.f;
   VkDeviceQueueCreateInfo qi = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
   qi.queueFamilyIndex = G.qfam;
@@ -273,7 +281,8 @@ API const char *nv_gpu_name(void) { return G.ready ? G.name : G.err; }
 /* ------------------------------------------------------------------ GPU fluid */
 
 #define MAXLEV 16
-#define MAXIT_BATCH 4
+#define MAXIT_BATCH 6
+#define SMALL_LEVEL_CELLS 32768 /* levels at or below this size run fused in one workgroup */
 
 typedef struct GpuFluid {
   int nx, ny, nz;
@@ -289,13 +298,21 @@ typedef struct GpuFluid {
   /* multigrid levels */
   int nlev, lx[MAXLEV], ly[MAXLEV], lz[MAXLEV];
   uint32_t lvx[MAXLEV], lvb[MAXLEV], lvr[MAXLEV], lst[MAXLEV]; /* x, b, r in F; stencil in S */
-  uint32_t solid_off, perm_off;
+  uint32_t solid_off, perm_off, lvl_off;
+  int small_from; /* first level handled by the fused kernel */
   /* R layout (floats) */
   uint32_t r_part, r_part2, r_npart;
   int last_iters;
   float last_res;
   double ms;
+  VkQueryPool qp, qbusy;
+  double busy_ms, wait_ms; /* GPU executing vs host round trips, accumulated */
+  int nts;              /* timestamps written this substep */
+  int ts_phase[64];     /* phase id of each timestamp */
+  double phase_ms[8];   /* GPU time per phase, accumulated until read */
 } GpuFluid;
+
+enum { PH_ADV_SCALARS, PH_COMBUST, PH_ADV_VEL, PH_FORCES, PH_PROJECT, PH_OTHER, PH_COUNT };
 
 enum { R_ZERO = 0, R_ONE = 1, R_RMAX0 = 2, R_BMAX = 3, R_PQ = 4, R_RZ = 5 /* 5,6 */, R_MAXV = 7, R_RMAXIT = 8 /* +64 */ };
 
@@ -305,6 +322,10 @@ static void begin(GpuFluid *g) {
   VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   vkBeginCommandBuffer_(g->cmd, &bi);
+  if (g->qbusy) {
+    vkCmdResetQueryPool_(g->cmd, g->qbusy, 0, 2);
+    vkCmdWriteTimestamp_(g->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g->qbusy, 0);
+  }
   vkCmdBindDescriptorSets_(g->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pl, 0, 1, &g->ds, 0, NULL);
   g->recording = 1;
 }
@@ -315,7 +336,9 @@ API long nv_gpu_sync_count(void) { return g_syncs; }
 static void flush(GpuFluid *g) {
   if (!g->recording) return;
   g_syncs++;
+  if (g->qbusy) vkCmdWriteTimestamp_(g->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g->qbusy, 1);
   vkEndCommandBuffer_(g->cmd);
+  double w0 = now_ms();
   VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
   si.commandBufferCount = 1;
   si.pCommandBuffers = &g->cmd;
@@ -323,6 +346,24 @@ static void flush(GpuFluid *g) {
   vkWaitForFences_(G.dev, 1, &G.fence, VK_TRUE, UINT64_MAX);
   vkResetFences_(G.dev, 1, &G.fence);
   g->recording = 0;
+  double busy = 0;
+  if (g->qbusy) {
+    uint64_t t[2];
+    if (vkGetQueryPoolResults_(G.dev, g->qbusy, 0, 2, sizeof t, t, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) ==
+        VK_SUCCESS)
+      busy = (double)(t[1] - t[0]) * G.ts_period * 1e-6;
+  }
+  g->busy_ms += busy;
+  g->wait_ms += now_ms() - w0 - busy;
+}
+
+/* GPU timestamp marking the START of a phase (the previous phase ends here) */
+static void begin(GpuFluid *g);
+static void ts(GpuFluid *g, int phase) {
+  if (!G.ts_ok || !g->qp || g->nts >= 64) return;
+  begin(g);
+  vkCmdWriteTimestamp_(g->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g->qp, (uint32_t)g->nts);
+  g->ts_phase[g->nts++] = phase;
 }
 
 static void barrier(GpuFluid *g) {
@@ -468,6 +509,10 @@ HIDDEN GpuFluid *gpuf_new(int nx, int ny, int nz, float dx, const float *o, int 
     soff += (size_t)g->lx[l] * g->ly[l] * g->lz[l];
   }
   g->perm_off = (uint32_t)soff; soff += 512;
+  g->lvl_off = (uint32_t)soff; soff += 7 * (size_t)nlev;
+  g->small_from = nlev - 1;
+  for (int l = nlev - 1; l >= 1; l--)
+    if ((size_t)g->lx[l] * g->ly[l] * g->lz[l] <= SMALL_LEVEL_CELLS) g->small_from = l;
   size_t parts = cdiv((int)g->nc, 256) + cdiv(nx + 1, 8) * cdiv(ny + 1, 8) * cdiv(nz + 1, 4) + (size_t)g->nt + 64;
   g->r_npart = (uint32_t)parts;
   g->r_part = 128;
@@ -502,6 +547,14 @@ HIDDEN GpuFluid *gpuf_new(int nx, int ny, int nz, float dx, const float *o, int 
   float *R = (float *)g->R.map;
   memset(R, 0, g->R.size);
   R[R_ONE] = 1.f;
+  if (G.ts_ok) {
+    VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    qi.queryCount = 64;
+    if (vkCreateQueryPool_(G.dev, &qi, NULL, &g->qp)) g->qp = VK_NULL_HANDLE;
+    qi.queryCount = 2;
+    if (vkCreateQueryPool_(G.dev, &qi, NULL, &g->qbusy)) g->qbusy = VK_NULL_HANDLE;
+  }
   return g;
 }
 
@@ -512,6 +565,8 @@ HIDDEN void gpuf_free(GpuFluid *g) {
   Buf *bs[] = {&g->F, &g->S, &g->R, &g->P, &g->PI, &g->stage};
   for (size_t i = 0; i < sizeof bs / sizeof *bs; i++) buf_free(bs[i]);
   if (g->ds) vkFreeDescriptorSets_(G.dev, G.dpool, 1, &g->ds);
+  if (g->qp) vkDestroyQueryPool_(G.dev, g->qp, NULL);
+  if (g->qbusy) vkDestroyQueryPool_(G.dev, g->qbusy, NULL);
   free(g);
 }
 
@@ -527,7 +582,7 @@ HIDDEN void gpuf_set_stencils(GpuFluid *g, const uint8_t *solid, uint8_t *const 
                               const uint8_t *perm) {
   size_t total = g->nc;
   for (int l = 0; l < g->nlev; l++) total += (size_t)g->lx[l] * g->ly[l] * g->lz[l];
-  total += 512;
+  total += 512 + 7 * (size_t)g->nlev;
   uint32_t *s = (uint32_t *)malloc(total * sizeof(uint32_t));
   for (size_t c = 0; c < g->nc; c++) s[c] = solid[c];
   for (int l = 0; l < g->nlev; l++) {
@@ -537,6 +592,11 @@ HIDDEN void gpuf_set_stencils(GpuFluid *g, const uint8_t *solid, uint8_t *const 
     for (size_t c = 0; c < n; c++) d[c] = (uint32_t)diag[l][c] | ((uint32_t)nb[l][c] << 8);
   }
   for (int i = 0; i < 512; i++) s[g->perm_off + i] = perm[i];
+  for (int l = 0; l < g->nlev; l++) {
+    uint32_t *t = s + g->lvl_off + 7 * l;
+    t[0] = (uint32_t)g->lx[l]; t[1] = (uint32_t)g->ly[l]; t[2] = (uint32_t)g->lz[l];
+    t[3] = g->lvx[l]; t[4] = g->lvb[l]; t[5] = g->lvr[l]; t[6] = g->lst[l];
+  }
   upload(g, &g->S, 0, s, total * sizeof(uint32_t));
   free(s);
 }
@@ -550,35 +610,39 @@ static void reduce(GpuFluid *g, uint32_t part, uint32_t n, uint32_t dst, int is_
 }
 
 static void vcycle(GpuFluid *g, int l) {
+  if (l >= g->small_from) { /* the rest of the cycle in one workgroup */
+    PC s;
+    pc_init(&s, l, g->nlev - 1, 12, 0);
+    s.o0[0] = g->lvl_off;
+    disp(g, SH_mg_small, &s, 1, 1, 1);
+    return;
+  }
   int nx = g->lx[l], ny = g->ly[l], nz = g->lz[l];
   uint32_t gx = cdiv(nx, 8), gy = cdiv(ny, 8), gz = cdiv(nz, 4);
   PC p;
-  pc_init(&p, nx, ny, nz, 0);
+  pc_init(&p, nx, ny, nz, 1);
   p.o0[0] = g->lvx[l]; p.o0[1] = g->lvb[l]; p.o0[2] = g->lvr[l]; p.o0[3] = g->lst[l];
-  disp(g, SH_mg, &p, gx, gy, gz);
-  int last = l == g->nlev - 1;
-  int sweeps = last ? 12 : 2;
-  p.n[3] = 1;
-  for (int s = 0; s < sweeps; s++)
-    for (int c = 0; c < 2; c++) { p.o1[0] = (uint32_t)c; disp(g, SH_mg, &p, gx, gy, gz); }
-  if (!last) {
-    p.n[3] = 2;
-    disp(g, SH_mg, &p, gx, gy, gz);
-    int cx = g->lx[l + 1], cy = g->ly[l + 1], cz = g->lz[l + 1];
-    PC q;
-    pc_init(&q, cx, cy, cz, 3);
-    q.o0[0] = g->lvr[l]; q.o0[1] = g->lst[l]; q.o0[2] = g->lvb[l + 1]; q.o0[3] = g->lst[l + 1];
-    q.o1[0] = (uint32_t)nx; q.o1[1] = (uint32_t)ny; q.o1[2] = (uint32_t)nz;
-    disp(g, SH_mg, &q, cdiv(cx, 8), cdiv(cy, 8), cdiv(cz, 4));
-    vcycle(g, l + 1);
-    PC r;
-    pc_init(&r, nx, ny, nz, 4);
-    r.o0[0] = g->lvx[l]; r.o0[3] = g->lst[l];
-    r.o1[0] = g->lvx[l + 1]; r.o1[1] = (uint32_t)cx; r.o1[2] = (uint32_t)cy;
-    disp(g, SH_mg, &r, gx, gy, gz);
-  }
-  p.n[3] = 1;
-  for (int s = 0; s < sweeps; s++)
+  /* pre-smooth from x = 0: the first red sweep needs no neighbours, so no zeroing pass */
+  for (int s = 0; s < 2; s++)
+    for (int c = 0; c < 2; c++) {
+      p.o1[0] = (uint32_t)c;
+      p.o1[1] = (s == 0 && c == 0) ? 1u : 0u;
+      disp(g, SH_mg, &p, gx, gy, gz);
+    }
+  p.o1[1] = 0;
+  int cx = g->lx[l + 1], cy = g->ly[l + 1], cz = g->lz[l + 1];
+  PC q; /* residual fused into the restriction */
+  pc_init(&q, cx, cy, cz, 5);
+  q.o0[0] = g->lvx[l]; q.o0[1] = g->lst[l]; q.o0[2] = g->lvb[l + 1]; q.o0[3] = g->lst[l + 1];
+  q.o1[0] = (uint32_t)nx; q.o1[1] = (uint32_t)ny; q.o1[2] = (uint32_t)nz; q.o1[3] = g->lvb[l];
+  disp(g, SH_mg, &q, cdiv(cx, 8), cdiv(cy, 8), cdiv(cz, 4));
+  vcycle(g, l + 1);
+  PC r;
+  pc_init(&r, nx, ny, nz, 4);
+  r.o0[0] = g->lvx[l]; r.o0[3] = g->lst[l];
+  r.o1[0] = g->lvx[l + 1]; r.o1[1] = (uint32_t)cx; r.o1[2] = (uint32_t)cy;
+  disp(g, SH_mg, &r, gx, gy, gz);
+  for (int s = 0; s < 2; s++)
     for (int c = 1; c >= 0; c--) { p.o1[0] = (uint32_t)c; disp(g, SH_mg, &p, gx, gy, gz); }
 }
 
@@ -741,6 +805,12 @@ HIDDEN void gpuf_substep(GpuFluid *g, const float *fp, float dt, double time) {
   double t0 = now_ms();
   int nx = g->nx, ny = g->ny, nz = g->nz;
   int mc = fp[FP_maccormack] > 0.5f;
+  g->nts = 0;
+  if (g->qp) {
+    begin(g);
+    vkCmdResetQueryPool_(g->cmd, g->qp, 0, 64);
+  }
+  ts(g, PH_ADV_SCALARS);
   /* scalars */
   PC p;
   pc_init(&p, nx, ny, nz, 0);
@@ -750,6 +820,7 @@ HIDDEN void gpuf_substep(GpuFluid *g, const float *fp, float dt, double time) {
   p.n[3] = mc ? 1 : 2;
   disp(g, SH_adv_scalars, &p, cdiv(nx, 8), cdiv(ny, 8), cdiv(nz, 4));
   /* combustion */
+  ts(g, PH_COMBUST);
   pc_init(&p, nx, ny, nz, 0);
   p.o0[0] = g->sc; p.o0[1] = g->sc + (uint32_t)g->nc; p.o0[2] = g->sc + 2u * (uint32_t)g->nc;
   p.o0[3] = g->sc + 3u * (uint32_t)g->nc; p.o1[0] = g->expn;
@@ -760,25 +831,53 @@ HIDDEN void gpuf_substep(GpuFluid *g, const float *fp, float dt, double time) {
   disp(g, SH_combust, &p, cdiv((int)g->nc, 256), 1, 1);
   /* velocity */
   if (fp[FP_reflect] > 0.5f) {
+    ts(g, PH_ADV_VEL);
     advect_velocity(g, g->u, g->v, g->w, g->u, g->v, g->w, g->u1, g->v1, g->w1, 0.5f * dt, mc);
+    ts(g, PH_FORCES);
     add_forces(g, g->u1, g->v1, g->w1, dt, fp, time);
+    ts(g, PH_OTHER);
     faces_op(g, 0, g->u0, g->v0, g->w0, g->u1, g->v1, g->w1, 0.f);
+    ts(g, PH_PROJECT);
     project(g, g->u1, g->v1, g->w1, fp);
+    ts(g, PH_OTHER);
     faces_op(g, 1, g->u0, g->v0, g->w0, g->u1, g->v1, g->w1, 0.f);
+    ts(g, PH_ADV_VEL);
     advect_velocity(g, g->u0, g->v0, g->w0, g->u1, g->v1, g->w1, g->u, g->v, g->w, 0.5f * dt, mc);
+    ts(g, PH_PROJECT);
     project(g, g->u, g->v, g->w, fp);
   } else {
+    ts(g, PH_ADV_VEL);
     advect_velocity(g, g->u, g->v, g->w, g->u, g->v, g->w, g->u1, g->v1, g->w1, dt, mc);
     uint32_t t;
     t = g->u; g->u = g->u1; g->u1 = t;
     t = g->v; g->v = g->v1; g->v1 = t;
     t = g->w; g->w = g->w1; g->w1 = t;
+    ts(g, PH_FORCES);
     add_forces(g, g->u, g->v, g->w, dt, fp, time);
+    ts(g, PH_PROJECT);
     project(g, g->u, g->v, g->w, fp);
   }
+  ts(g, PH_OTHER);
   faces_op(g, 2, g->u, g->v, g->w, 0, 0, 0, 2.f * fp[FP_cfl] * g->dx / dt);
+  ts(g, PH_OTHER);
   flush(g);
+  if (g->qp && g->nts > 1) {
+    uint64_t t[64];
+    if (vkGetQueryPoolResults_(G.dev, g->qp, 0, (uint32_t)g->nts, sizeof t, t, sizeof(uint64_t),
+                               VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS)
+      for (int i = 0; i + 1 < g->nts; i++)
+        g->phase_ms[g->ts_phase[i]] += (double)(t[i + 1] - t[i]) * G.ts_period * 1e-6;
+  }
   g->ms += now_ms() - t0;
+}
+
+/* GPU-side time per phase since the last call: adv scalars, combust, adv velocity, forces, project, other */
+API void nv_gpu_phases(void *fluid_gpu, double *out) {
+  GpuFluid *g = (GpuFluid *)fluid_gpu;
+  for (int i = 0; i < PH_COUNT; i++) { out[i] = g->phase_ms[i]; g->phase_ms[i] = 0; }
+  out[PH_COUNT] = g->busy_ms;     /* GPU actually executing */
+  out[PH_COUNT + 1] = g->wait_ms; /* host-side latency around each submit (CPU wake-up, submit) */
+  g->busy_ms = g->wait_ms = 0;
 }
 
 HIDDEN float gpuf_max_speed(GpuFluid *g) {
