@@ -23,6 +23,8 @@ for key in keys:
         bpy.ops.nova.add_preset(preset=key, setup_scene=True)
         so = bpy.context.object
         so.nova.cache_dir = tmp + "/"
+        if os.environ.get("NOVA_DEVICE"):
+            so.nova.fluid.device = os.environ["NOVA_DEVICE"]
         t0 = time.perf_counter()
         for f in range(so.nova.frame_start, so.nova.frame_start + frames):
             sc.frame_set(f)  # live preview path (frame_change handler)
@@ -33,7 +35,7 @@ for key in keys:
         sim.wait_vdb(so)
         print(f"[{key:10s}] {frames} frames {dt:6.2f}s  particles={st.get('count')} shown={npts} "
               f"pms={st.get('particle_ms', 0):.1f} fms={st.get('fluid_ms', 0):.0f} cg={st.get('cg_iters')} "
-              f"active={st.get('active', 0):.2f} vdb={vdb} vol={so.nova.fluid.volume.name if so.nova.fluid.volume else None}")
+              f"active={st.get('active', 0):.2f} dev={st.get('device','')!r} vdb={vdb} vol={so.nova.fluid.volume.name if so.nova.fluid.volume else None}")
     except Exception as e:
         import traceback; traceback.print_exc(); ok = False
         print(f"[{key}] FAILED: {e}")

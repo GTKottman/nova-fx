@@ -60,6 +60,7 @@ class Runtime:
         self.sys = core.System()
         self.fluid = None
         self.fluid_key = None
+        self.gpu_note = ""
         self.last_frame = None
         self.em_state = {}  # emitter name -> dict(prev=Matrix, carry=float, tris=...)
         self.col_prev = {}
@@ -136,12 +137,18 @@ def ensure_fluid(rt, sysob):
             rt.sys.set_fluid(None)
         return
     res, dx, origin = fluid_layout(sysob)
-    key = (res, round(dx, 6), tuple(round(o, 5) for o in origin))
+    key = (res, round(dx, 6), tuple(round(o, 5) for o in origin), fl.device)
     if rt.fluid is None or rt.fluid_key != key:
         if rt.fluid:
             rt.fluid.free()
         rt.fluid = core.Fluid(res, dx, origin)
         rt.fluid_key = key
+        rt.gpu_note = ""
+        if fl.device == "GPU":
+            if rt.fluid.use_gpu(True):
+                rt.gpu_note = "GPU: " + core.gpu_name()
+            else:
+                rt.gpu_note = "GPU unavailable, using CPU: " + core.gpu_name()
         rt.sys.set_fluid(rt.fluid)
 
 
@@ -464,6 +471,7 @@ def step(scene, sysob, frame, depsgraph=None, write=True):
             write_vdb(rt, sysob, frame)
     st = rt.sys.stats(rt.fluid)
     st["frame_ms"] = sim_ms
+    st["device"] = rt.gpu_note
     st["frame"] = frame
     rt.stats = st
     return rt
@@ -497,6 +505,7 @@ def _vdb_write(path, grids_np, dx, origin, vel, ijk):
 def write_vdb(rt, sysob, frame):
     """Only the active box is copied and written: cost follows the effect, not the domain."""
     f = rt.fluid
+    f.sync(velocity=sysob.nova.fluid.write_velocity)
     box = f.active_bbox()
     if box is None:
         data, vel, ijk = {"density": None, "heat": None, "flame": None}, None, (0, 0, 0)

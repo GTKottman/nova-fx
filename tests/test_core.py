@@ -122,32 +122,32 @@ def test_turbulence_grid():
     assert used and err < 0.06 and not small and big
 
 
-def test_gpu_advection_matches_cpu():
-    """Vulkan MacCormack advection vs the CPU solver on the same field (skipped without a Vulkan GPU)."""
-    import ctypes as C
-    L = core.lib()
-    if not hasattr(L, "nv_gpu_init"):
-        print("gpu: skipped, core built without the Vulkan backend"); return
-    L.nv_gpu_init.restype = C.c_int; L.nv_gpu_name.restype = C.c_char_p
-    if L.nv_gpu_init() != 0:
-        print("gpu: skipped,", L.nv_gpu_name().decode()); return
-    L.nv_fluid_bench_advect.restype = C.c_double; L.nv_fluid_bench_advect.argtypes = [C.c_void_p, C.c_float, C.c_int]
-    L.nv_gpu_bench_advect.argtypes = [C.c_int] * 3 + [C.c_float] + [C.c_void_p] * 5 + [C.c_int, C.c_void_p]
-    n, dx, dt = 64, 0.03, 1 / 48
-    f = core.Fluid((n, n, n), dx, (0, 0, 0)); f.set_params(dict(sparse=0, maccormack=1))
-    arr = lambda which, size: np.ctypeslib.as_array(L.nv_fluid_ptr(f.h, which), shape=(size,))
-    u, v, w = arr(4, n * n * (n + 1)), arr(5, n * n * (n + 1)), arr(6, n * n * (n + 1))
-    u[:] = np.sin(np.arange(u.size) * 0.001) * 2; v[:] = np.cos(np.arange(v.size) * 0.0013) * 2; w[:] = 1.5
-    z, y, x = np.mgrid[0:n, 0:n, 0:n]
-    d = f.field(0); d[:] = np.exp(-(((x - n / 2) ** 2 + (y - n / 2) ** 2 + (z - n / 3) ** 2) / (n / 6) ** 2))
-    src = d.copy(); L.nv_fluid_bench_advect(f.h, dt, 1); cpu = f.field(0).copy()
-    out = np.empty_like(src); t = (C.c_double * 3)()
-    uu, vv, ww = u.copy(), v.copy(), w.copy()
-    assert L.nv_gpu_bench_advect(n, n, n, dt / dx, uu.ctypes.data, vv.ctypes.data, ww.ctypes.data,
-                                 src.ctypes.data, out.ctypes.data, 10, t) == 0
-    err = np.abs(out - cpu).max()
-    print(f"gpu ({L.nv_gpu_name().decode()}): advection matches CPU to {err:.1e}, {t[1]:.2f} ms per field at 64^3")
-    assert err < 1e-5
+def test_gpu_solver_matches_cpu():
+    """Whole fluid solver on the GPU (Vulkan) vs the CPU solver: combustion, vorticity, turbulence,
+    a collider, velocity sources, MGPCG. Skipped on machines without a Vulkan GPU."""
+    probe = core.Fluid((8, 8, 8), 0.1, (0, 0, 0))
+    if not probe.use_gpu(True):
+        print("gpu: skipped,", core.gpu_name()); probe.free(); return
+    probe.free()
+    def run(gpu, frames):
+        n = 40
+        f = core.Fluid((n, n, 60), 0.06, (-1.2, -1.2, 0))
+        f.set_params(dict(sparse=0, vorticity=0.5, turb_amp=4.0, turb_freq=3.0, max_sub=2))
+        s = core.System(); s.set_fluid(f)
+        if gpu: f.use_gpu(True)
+        m = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, -2.2]], np.float32).ravel()
+        mi = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 2.2]], np.float32).ravel()
+        s.set_colliders([[1, *m, *mi, 0.35, 0, 0, 0, 0, 0]])
+        for fr in range(frames):
+            f.splat([[0, 0, 0.3]], 0.2, dens=1, heat=1.5, fuel=1, vel=[[0, 0, 1]], vel_amt=0.5, mode=1)
+            s.frame(1 / 24, 1, f)
+        f.sync(True)
+        out = np.stack([f.field(i).copy() for i in range(4)]); s.free(); f.free(); return out
+    for frames, tol in ((1, 1e-4), (8, 5e-3)):
+        a, b = run(False, frames), run(True, frames)
+        err = np.abs(a - b).max() / np.abs(a).max()
+        print(f"gpu ({core.gpu_name()}): {frames} frame(s), max difference {err*100:.4f}% of peak")
+        assert err < tol
 
 
 if __name__ == "__main__":

@@ -47,50 +47,29 @@ static void omp_set_num_threads(int n) { (void)n; }
 
 /* ===================================================================== parameter tables */
 
-/* Per particle-type ("kind") parameters. */
-#define KIND_PARAMS(X)                                                                    \
-  X(life_min, 1.0) X(life_max, 2.0)                                                       \
-  X(gravity, 1.0) X(drag_lin, 0.0) X(drag_quad, 0.0) X(buoyancy, 0.0) X(turb, 1.0)        \
-  X(fluid_drag, 0.0) X(wind, 1.0) X(force, 1.0)                                           \
-  X(size_start, 0.02) X(size_end, 0.01) X(size_var, 0.2) X(size_curve, 1.0)               \
-  X(color_mode, 0) X(c0r, 1.0) X(c0g, 0.6) X(c0b, 0.2) X(c1r, 1.0) X(c1g, 0.2)            \
-  X(c1b, 0.05) X(color_var, 0.1) X(color_curve, 1.0) X(hue_random, 0.0)                   \
-  X(inherit_color, 0)                                                                     \
-  X(temp0, 2200) X(temp_var, 200) X(cool, 0.5) X(cool_rad, 0.0)                           \
-  X(emit, 10) X(emit_var, 0.2) X(fade_in, 0.02) X(fade_out, 0.3)                          \
-  X(twinkle_freq, 0) X(twinkle_amt, 0)                                                    \
-  X(collide, 1) X(bounce, 0.3) X(friction, 0.2)                                           \
-  X(death_kind, -1) X(death_count, 0) X(death_pattern, 0) X(death_speed, 10)              \
-  X(death_speed_var, 0.15) X(death_inherit, 0.3)                                          \
-  X(trail_kind, -1) X(trail_rate, 0) X(trail_inherit, 0.2) X(trail_jitter, 0.3)           \
-  X(split_kind, -1) X(split_rate, 0) X(split_count, 3) X(split_speed, 3)                  \
-  X(split_inherit, 0.7) X(split_max_gen, 3)                                               \
-  X(hit_kind, -1) X(hit_count, 0) X(hit_speed, 2)                                         \
-  X(fl_smoke, 0) X(fl_heat, 0) X(fl_fuel, 0)
+#include "nova_params.h"
 
-/* Global particle-system parameters. */
-#define SYS_PARAMS(X)                                                                     \
-  X(gx, 0) X(gy, 0) X(gz, -9.81) X(wx, 0) X(wy, 0) X(wz, 0)                               \
-  X(turb_amp, 0) X(turb_freq, 0.5) X(turb_speed, 0.5) X(turb_octaves, 2)                  \
-  X(max_particles, 2000000) X(seed, 0) X(t_ambient, 293)
-
-/* Fluid solver parameters. Temperature is in "kilo-kelvin above ambient". */
-#define FLUID_PARAMS(X)                                                                   \
-  X(buoy_heat, 2.0) X(buoy_smoke, 0.3) X(vorticity, 0.35) X(cool, 0.4) X(cool_rad, 0.08)  \
-  X(smoke_decay, 0.02) X(vel_decay, 0.0) X(fuel_decay, 0.0)                               \
-  X(ignite, 0.25) X(burn_rate, 2.0) X(heat_release, 1.5) X(smoke_yield, 0.6)              \
-  X(expansion, 1.0) X(flame_decay, 8.0)                                                   \
-  X(turb_amp, 0.0) X(turb_freq, 1.0) X(turb_speed, 0.5)                                   \
-  X(wind_x, 0) X(wind_y, 0) X(wind_z, 0) X(wind_drag, 0)                                  \
-  X(cfl, 2.5) X(max_sub, 4) X(cg_tol, 1e-3) X(cg_iter, 60)                                \
-  X(maccormack, 1) X(reflect, 1) X(closed_floor, 1) X(seed, 0) X(sparse, 1)
+/* GPU backend (gpu_vk.c). Weak: the core links and runs without it. */
+typedef struct GpuFluid GpuFluid;
+#define WEAK __attribute__((weak))
+WEAK GpuFluid *gpuf_new(int nx, int ny, int nz, float dx, const float *o, int nlev, const int *ldims);
+WEAK void gpuf_free(GpuFluid *g);
+WEAK void gpuf_reset(GpuFluid *g);
+WEAK void gpuf_set_stencils(GpuFluid *g, const uint8_t *solid, uint8_t *const *diag, uint8_t *const *nb,
+                            const uint8_t *perm);
+WEAK void gpuf_substep(GpuFluid *g, const float *fp, float dt, double time);
+WEAK float gpuf_max_speed(GpuFluid *g);
+WEAK void gpuf_splat(GpuFluid *g, int n, const float *pos, float radius, float dens, float heat, float fuel,
+                     const float *vel, float vel_amt, int mode);
+WEAK void gpuf_deposit(GpuFluid *g, int n, const float *pos, const float *amt);
+WEAK void gpuf_download(GpuFluid *g, int which, float *dst);
+WEAK int gpuf_active_bbox(GpuFluid *g, int *b);
+WEAK void gpuf_stats(GpuFluid *g, int *iters, float *res, double *ms);
 
 #define E_K(n, d) KP_##n,
 #define E_S(n, d) SP_##n,
-#define E_F(n, d) FP_##n,
 enum { KIND_PARAMS(E_K) KP_COUNT };
 enum { SYS_PARAMS(E_S) SP_COUNT };
-enum { FLUID_PARAMS(E_F) FP_COUNT };
 #define NAME(n, d) #n ","
 #define DEF(n, d) (float)(d),
 static const char kind_names[] = KIND_PARAMS(NAME);
@@ -367,6 +346,8 @@ typedef struct NvFluid {
   uint8_t *t_force; /* tiles whose solid cells changed (re-type them) */
   int *tl_adv, *tl_prs, n_adv, n_prs, *tl_chg, n_chg, *cand;
   int vox_pending, vox_box[6]; /* cells to re-voxelize against the colliders */
+  GpuFluid *gpu;               /* non-NULL: the solver runs on the GPU, CPU arrays are download targets */
+  int hier_ver, gpu_hier_ver;
 } NvFluid;
 
 #define TS 8
@@ -454,6 +435,7 @@ API NvFluid *nv_fluid_new(int nx, int ny, int nz, float dx, float ox, float oy, 
 
 API void nv_fluid_free(NvFluid *f) {
   if (!f) return;
+  if (f->gpu && gpuf_free) gpuf_free(f->gpu);
   float *arrs[] = {f->u, f->v, f->w, f->u0, f->v0, f->w0, f->u1, f->v1, f->w1, f->d, f->T, f->fuel,
                    f->flame, f->expn, f->phi, f->cg_r, f->cg_z, f->cg_p, f->cg_q, f->cg_b};
   for (size_t i = 0; i < sizeof arrs / sizeof *arrs; i++) free(arrs[i]);
@@ -493,6 +475,40 @@ API void nv_fluid_reset(NvFluid *f) {
   }
   f->solid_dirty = 1;
   f->time = 0;
+  if (f->gpu) gpuf_reset(f->gpu);
+}
+
+/* Move the solver to the GPU (on = 1) or back (0). Returns 1 if the GPU is in use. Fields restart
+ * empty on the GPU, so switch at the start of a simulation. */
+API int nv_fluid_set_gpu(NvFluid *f, int on) {
+  if (!on || !gpuf_new) {
+    if (f->gpu) gpuf_free(f->gpu);
+    f->gpu = NULL;
+    return 0;
+  }
+  if (f->gpu) return 1;
+  int dims[3 * 16];
+  for (int l = 0; l < f->nlev; l++) {
+    dims[3 * l] = f->lev[l].nx; dims[3 * l + 1] = f->lev[l].ny; dims[3 * l + 2] = f->lev[l].nz;
+  }
+  f->gpu = gpuf_new(f->nx, f->ny, f->nz, f->dx, f->o, f->nlev, dims);
+  f->gpu_hier_ver = -1;
+  f->solid_dirty = 1;
+  return f->gpu ? 1 : 0;
+}
+
+/* GPU mode: copy the scalar fields (and velocities if asked) into the CPU arrays read by Python */
+API void nv_fluid_sync(NvFluid *f, int with_velocity) {
+  if (!f->gpu) return;
+  gpuf_download(f->gpu, 0, f->d);
+  gpuf_download(f->gpu, 1, f->T);
+  gpuf_download(f->gpu, 2, f->fuel);
+  gpuf_download(f->gpu, 3, f->flame);
+  if (with_velocity) {
+    gpuf_download(f->gpu, 4, f->u);
+    gpuf_download(f->gpu, 5, f->v);
+    gpuf_download(f->gpu, 6, f->w);
+  }
 }
 
 API float *nv_fluid_ptr(NvFluid *f, int which) {
@@ -661,7 +677,7 @@ static inline void tile_mark_range(NvFluid *f, uint8_t *m, int i0, int i1, int j
  * source wrote to, so only those are scanned: the cost follows the effect, not the domain. */
 static void update_tiles(NvFluid *f) {
   const float eps = 1e-4f;
-  int full = f->fp[FP_sparse] < 0.5f;
+  int full = f->fp[FP_sparse] < 0.5f || f->gpu; /* the GPU solver is dense */
   int nc = 0;
   for (int t = 0; t < f->nt; t++) {
     if (full || f->t_adv[t] || f->t_dirty[t]) f->cand[nc++] = t;
@@ -747,6 +763,7 @@ static void update_tiles(NvFluid *f) {
 }
 
 API int nv_fluid_active_bbox(NvFluid *f, int *b) {
+  if (f->gpu) return gpuf_active_bbox(f->gpu, b);
   /* cell bounds [i0,i1) [j0,j1) [k0,k1) of everything that can hold smoke/heat/fuel/flame */
   int lo[3] = {1 << 30, 1 << 30, 1 << 30}, hi[3] = {-1, -1, -1};
   for (int t = 0; t < f->nt; t++) {
@@ -1015,6 +1032,7 @@ static inline void coarse_type_cell(const Lev *F, Lev *C, int I, int J, int K) {
 }
 
 static void hierarchy_full(NvFluid *f) {
+  f->hier_ver++;
   int cf = f->fp[FP_closed_floor] > 0.5f;
   for (int l = 0; l < f->nlev; l++) {
     Lev *L = &f->lev[l];
@@ -1035,6 +1053,7 @@ static void hierarchy_full(NvFluid *f) {
 /* Re-type and re-stencil only the blocks above changed tiles (plus a one-block halo, because a
  * stencil reads its neighbours' types). Work is O(changed tiles), independent of the domain. */
 static void hierarchy_incremental(NvFluid *f) {
+  f->hier_ver++;
   int cf = f->fp[FP_closed_floor] > 0.5f;
   for (int l = 0; l < f->nlev; l++) {
     Lev *L = &f->lev[l];
@@ -1570,6 +1589,7 @@ static void combust(NvFluid *f, float dt) {
 
 /* fastest face; faces outside the pressure tiles are zero by construction, so only those count */
 static float max_speed(NvFluid *f) {
+  if (f->gpu) return gpuf_max_speed(f->gpu);
   float m = 0.f;
   float *arr[3] = {f->u, f->v, f->w};
 #pragma omp parallel for reduction(max : m) schedule(dynamic, 1)
@@ -1639,6 +1659,17 @@ static void swapp(float **a, float **b) {
 
 static void fluid_substep(NvFluid *f, float dt) {
   update_tiles(f);
+  if (f->gpu) {
+    if (f->gpu_hier_ver != f->hier_ver) {
+      uint8_t *diag[16], *nb[16];
+      for (int l = 0; l < f->nlev; l++) { diag[l] = f->lev[l].diag; nb[l] = f->lev[l].nb; }
+      gpuf_set_stencils(f->gpu, f->solid, diag, nb, PERM);
+      f->gpu_hier_ver = f->hier_ver;
+    }
+    gpuf_substep(f->gpu, f->fp, dt, f->time);
+    f->time += dt;
+    return;
+  }
   double t0 = now_ms();
   advect_scalars(f, f->u, f->v, f->w, dt);
   double t1 = now_ms();
@@ -1694,6 +1725,10 @@ API void nv_fluid_step(NvFluid *f, float dt) {
  * Smooth kernel w = (1 - r^2/R^2)^2. vel (3n, may be NULL) pulls face velocity toward it. */
 API void nv_fluid_splat(NvFluid *f, int n, const float *pos, float radius, float dens, float heat, float fuel,
                         const float *vel, float vel_amt, int mode) {
+  if (f->gpu) {
+    gpuf_splat(f->gpu, n, pos, radius, dens, heat, fuel, vel, vel_amt, mode);
+    return;
+  }
   int nx = f->nx, ny = f->ny, nz = f->nz;
   float dx = f->dx, R = fmaxf(radius, 0.75f * dx), R2 = R * R, inv = 1.f / dx;
   int rr = (int)ceilf(R * inv) + 1;
@@ -1748,6 +1783,10 @@ API void nv_fluid_splat(NvFluid *f, int n, const float *pos, float radius, float
  * amt is 3 floats per point: smoke, heat, fuel (already multiplied by dt). */
 static void fluid_deposit(NvFluid *f, int n, const float *pos, const float *amt) {
   if (n <= 0) return;
+  if (f->gpu) {
+    gpuf_deposit(f->gpu, n, pos, amt);
+    return;
+  }
   int nx = f->nx, ny = f->ny, nz = f->nz;
   float inv = 1.f / f->dx;
   int *kb = (int *)malloc(sizeof(int) * n);
@@ -2838,12 +2877,19 @@ API void nv_frame(NvSys *s, NvFluid *f, float dt, int psub) {
   }
   int n = psub > fsub ? psub : fsub;
   float h = dt / n;
+  int couple = 0;
+  for (int k = 0; s && k < s->nk; k++) couple |= s->kp[k][KP_fluid_drag] > 0.f;
   double fms = 0;
   for (int i = 0; i < n; i++) {
     if (f && (i * fsub) / n != ((i + 1) * fsub) / n) {
       /* fluid steps spread evenly among particle substeps */
       double a = now_ms();
       fluid_substep(f, dt / fsub);
+      if (f->gpu && s && couple) { /* particles riding the flow read the CPU copy of the velocity */
+        gpuf_download(f->gpu, 4, f->u);
+        gpuf_download(f->gpu, 5, f->v);
+        gpuf_download(f->gpu, 6, f->w);
+      }
       fms += now_ms() - a;
     }
     if (s) nv_sys_step(s, h);
@@ -2861,6 +2907,14 @@ API void nv_stats(NvSys *s, NvFluid *f, float *o) {
   o[2] = f ? (float)f->ms : 0.f;
   o[3] = f ? (float)f->last_iters : 0.f;
   o[4] = f ? f->last_res : 0.f;
+  if (f && f->gpu) {
+    int it;
+    float res;
+    double ms;
+    gpuf_stats(f->gpu, &it, &res, &ms);
+    o[3] = (float)it;
+    o[4] = res;
+  }
   o[5] = f ? f->maxvel : 0.f;
 }
 

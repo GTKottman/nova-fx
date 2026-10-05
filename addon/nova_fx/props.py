@@ -103,6 +103,10 @@ def _fluid_annotations():
         ann[name] = BoolProperty(name=label, default=d, description=desc)
     ann["wind"] = FloatVectorProperty(name="Wind", subtype="VELOCITY", size=3, default=(0, 0, 0))
     ann["enabled"] = BoolProperty(name="Fluid", default=False, description="Simulate smoke and fire on a grid")
+    ann["device"] = EnumProperty(name="Device", items=[
+        ("CPU", "CPU", "Sparse solver on all CPU cores: best when the fire fills a small part of the domain"),
+        ("GPU", "GPU", "Vulkan compute on the graphics card: best for big or busy domains"),
+    ], default="CPU", description="Where the fire and smoke solver runs (results match to rounding)")
     ann["domain"] = PointerProperty(name="Domain", type=bpy.types.Object,
                                     description="Box object that bounds the fluid")
     ann["resolution"] = IntProperty(name="Resolution", default=96, min=16, max=512,

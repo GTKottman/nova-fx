@@ -17,6 +17,9 @@ sc.frame_start, sc.frame_end = 1, max(frame, 250)
 bpy.ops.nova.add_preset(preset=key, setup_scene=True)
 so = bpy.context.object
 so.nova.cache_dir = tempfile.mkdtemp(prefix="nova_r_", dir="/tmp/claude-1000") + "/"
+import os
+if os.environ.get("NOVA_DEVICE"):
+    so.nova.fluid.device = os.environ["NOVA_DEVICE"]
 r = sc.render
 r.resolution_x, r.resolution_y, r.resolution_percentage = 960, 540, 100
 r.filepath = out

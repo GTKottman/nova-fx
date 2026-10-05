@@ -55,6 +55,8 @@ _SIGS = {
     "nv_fluid_max_divergence": (C.c_float, [_vp]),
     "nv_fluid_splat": (None, [_vp, C.c_int, _f, C.c_float, C.c_float, C.c_float, C.c_float, _f, C.c_float, C.c_int]),
     "nv_fluid_step": (None, [_vp, C.c_float]),
+    "nv_fluid_set_gpu": (C.c_int, [_vp, C.c_int]),
+    "nv_fluid_sync": (None, [_vp, C.c_int]),
     "nv_fluid_timings": (None, [_vp, _f]),
     "nv_frame": (None, [_vp, _vp, C.c_float, C.c_int]),
     "nv_stats": (None, [_vp, _vp, _f]),
@@ -72,7 +74,7 @@ def build(force=False):
         alt = os.path.join(HERE, "..", "..", "core")
         src_dir = alt if os.path.exists(os.path.join(alt, "nova_core.c")) else src_dir
     sources = [os.path.join(src_dir, "nova_core.c")]
-    if os.path.exists(os.path.join(src_dir, "gpu_vk.c")) and os.path.exists(os.path.join(src_dir, "shaders_spv.h")):
+    if all(os.path.exists(os.path.join(src_dir, f)) for f in ("gpu_vk.c", "shaders_spv.h", "nova_params.h")):
         sources.append(os.path.join(src_dir, "gpu_vk.c"))
     log = []
     # with the GPU backend first; without it if this machine has no Vulkan headers
@@ -100,7 +102,9 @@ def lib():
                 raise RuntimeError("Nova FX core could not be compiled:\n" + log)
         L = C.CDLL(LIB_PATH)
         for name, (res, args) in _SIGS.items():
-            fn = getattr(L, name)
+            fn = getattr(L, name, None)
+            if fn is None:
+                continue  # optional symbol (e.g. GPU backend not compiled in)
             fn.restype = res
             fn.argtypes = args
         _lib = L
@@ -141,6 +145,16 @@ def tables():
         _tables["sys"] = Params(L.nv_sys_param_names, L.nv_sys_param_defaults)
         _tables["fluid"] = Params(L.nv_fluid_param_names, L.nv_fluid_param_defaults)
     return _tables
+
+
+def gpu_name():
+    L = lib()
+    if not hasattr(L, "nv_gpu_name"):
+        return "core built without the Vulkan backend"
+    L.nv_gpu_init.restype = C.c_int
+    L.nv_gpu_name.restype = C.c_char_p
+    L.nv_gpu_init()
+    return L.nv_gpu_name().decode(errors="replace")
 
 
 def blackbody(T):
@@ -202,6 +216,17 @@ class Fluid:
 
     def step(self, dt):
         lib().nv_fluid_step(self.h, dt)
+
+    def use_gpu(self, on=True):
+        """Move the solver to the GPU (Vulkan). Returns True if it is running there."""
+        if not hasattr(lib(), "nv_fluid_set_gpu"):
+            return False
+        return bool(lib().nv_fluid_set_gpu(self.h, 1 if on else 0))
+
+    def sync(self, velocity=False):
+        """GPU mode: bring the fields back so field()/cell_velocity() see the current state."""
+        if hasattr(lib(), "nv_fluid_sync"):
+            lib().nv_fluid_sync(self.h, 1 if velocity else 0)
 
     def reset(self):
         lib().nv_fluid_reset(self.h)
