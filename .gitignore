@@ -1,0 +1,8 @@
+# built per machine (-march=native) and copied in by `make -C core`
+addon/nova_fx/lib/libnovacore.so
+addon/nova_fx/lib/nova_core.c
+dist/
+__pycache__/
+*.pyc
+nova_cache/
+*.blend1
