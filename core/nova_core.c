@@ -1822,6 +1822,13 @@ typedef struct NvSys {
   float *dep_pos, *dep_amt;
   int dep_cap;
   Sdf sdf[MAXSDF];
+  /* turbulence baked on a grid around the particles (used when far cheaper than per-particle noise) */
+  float *tg;
+  size_t tg_cap;
+  int tg_n[3];
+  float tg_o[3], tg_h;
+  int tg_mode; /* -1 never, 0 auto, 1 always (tests) */
+  int tg_used, tg_on;
 } NvSys;
 
 #define PB_FLOATS(X) X(x) X(y) X(z) X(vx) X(vy) X(vz) X(age) X(life) X(temp) X(size) X(cr) X(cg) X(cb)
@@ -1905,6 +1912,7 @@ API void nv_sys_free(NvSys *s) {
   free(s->ev_trail); free(s->ev_death); free(s->ev_split); free(s->ev_hit); free(s->dead);
   free(s->cnt); free(s->off); free(s->dep_pos); free(s->dep_amt);
   for (int i = 0; i < MAXSDF; i++) free(s->sdf[i].d);
+  free(s->tg);
   free(s);
 }
 
@@ -2396,6 +2404,86 @@ static void pattern_dir(int pat, int j, int cnt, uint32_t pid, uint32_t sd, cons
   }
 }
 
+API void nv_sys_set_turb_grid(NvSys *s, int mode) { s->tg_mode = mode; }
+API int nv_sys_turb_grid_used(NvSys *s) { return s->tg_used; }
+
+/* Bake the curl-noise field on a grid over the particles' bounding box, 6 samples per period of the
+ * finest octave (~4% RMS difference from exact evaluation). Worth it only when the grid is much smaller than the particle count: then each
+ * particle pays one trilinear lookup instead of 3 noise evaluations per octave. */
+static int bake_turbulence(NvSys *s, int n, float tfr, float tt, int toct, uint32_t sd) {
+  s->tg_used = 0;
+  if (s->tg_mode < 0 || n <= 0) {
+    s->tg_on = 0;
+    return 0;
+  }
+  const PB *P = &s->p;
+  float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+  float lx = 1e30f, ly = 1e30f, lz = 1e30f, hx = -1e30f, hy = -1e30f, hz = -1e30f;
+#pragma omp parallel for reduction(min : lx, ly, lz) reduction(max : hx, hy, hz) schedule(static)
+  for (int i = 0; i < n; i++) {
+    lx = fminf(lx, P->x[i]); ly = fminf(ly, P->y[i]); lz = fminf(lz, P->z[i]);
+    hx = fmaxf(hx, P->x[i]); hy = fmaxf(hy, P->y[i]); hz = fmaxf(hz, P->z[i]);
+  }
+  lo[0] = lx; lo[1] = ly; lo[2] = lz; hi[0] = hx; hi[1] = hy; hi[2] = hz;
+  float h = 1.f / (fmaxf(tfr, 1e-6f) * (float)(1 << (toct - 1)) * 6.f);
+  double G = 1;
+  int nn[3];
+  for (int a = 0; a < 3; a++) {
+    double cells = ceil((hi[a] - lo[a]) / h) + 2;
+    if (cells > 4096) {
+      s->tg_on = 0;
+      return 0;
+    }
+    nn[a] = (int)cells;
+    G *= cells;
+  }
+  /* hysteresis: switch on below N/4, stay on until N/2, so the field never flickers between modes */
+  double limit = s->tg_on ? 0.5 * n : 0.25 * n;
+  if (s->tg_mode == 0 && (G > limit || G > 16e6)) {
+    s->tg_on = 0;
+    return 0;
+  }
+  s->tg_on = 1;
+  size_t need = (size_t)G * 3;
+  if (need > s->tg_cap) {
+    free(s->tg);
+    s->tg = (float *)malloc(need * sizeof(float));
+    s->tg_cap = need;
+  }
+  float *g = s->tg;
+#pragma omp parallel for schedule(static)
+  for (int k = 0; k < nn[2]; k++)
+    for (int j = 0; j < nn[1]; j++)
+      for (int i = 0; i < nn[0]; i++) {
+        float c[3];
+        float X = lo[0] + i * h, Y = lo[1] + j * h, Z = lo[2] + k * h;
+        curl_noise(X * tfr, Y * tfr, Z * tfr, tt, toct, sd, c);
+        size_t o = 3 * ((size_t)i + (size_t)nn[0] * ((size_t)j + (size_t)nn[1] * k));
+        g[o] = c[0]; g[o + 1] = c[1]; g[o + 2] = c[2];
+      }
+  memcpy(s->tg_n, nn, sizeof nn);
+  memcpy(s->tg_o, lo, sizeof lo);
+  s->tg_h = h;
+  s->tg_used = 1;
+  return 1;
+}
+
+static inline void turb_lookup(const NvSys *s, float x, float y, float z, float *c) {
+  float gx = (x - s->tg_o[0]) / s->tg_h, gy = (y - s->tg_o[1]) / s->tg_h, gz = (z - s->tg_o[2]) / s->tg_h;
+  int nx = s->tg_n[0], ny = s->tg_n[1], nz = s->tg_n[2];
+  gx = clampf(gx, 0.f, nx - 1.001f); gy = clampf(gy, 0.f, ny - 1.001f); gz = clampf(gz, 0.f, nz - 1.001f);
+  int i = (int)gx, j = (int)gy, k = (int)gz;
+  float tx = gx - i, ty = gy - j, tz = gz - k;
+  size_t sx = 3, sy = 3 * (size_t)nx, sz = 3 * (size_t)nx * ny;
+  const float *g = s->tg + 3 * ((size_t)i + (size_t)nx * ((size_t)j + (size_t)ny * k));
+  for (int a = 0; a < 3; a++) {
+    const float *q = g + a;
+    float c00 = lerpf(q[0], q[sx], tx), c10 = lerpf(q[sy], q[sy + sx], tx);
+    float c01 = lerpf(q[sz], q[sz + sx], tx), c11 = lerpf(q[sz + sy], q[sz + sy + sx], tx);
+    c[a] = lerpf(lerpf(c00, c10, ty), lerpf(c01, c11, ty), tz);
+  }
+}
+
 API void nv_sys_step(NvSys *s, float dt) {
   PB *P = &s->p;
   int n = P->n;
@@ -2409,6 +2497,7 @@ API void nv_sys_step(NvSys *s, float dt) {
   const uint32_t sd = (uint32_t)s->sp[SP_seed] * 2654435761u;
   const uint32_t step = s->stepno;
   NvFluid *fl = s->fluid;
+  const int baked = tamp != 0.f && bake_turbulence(s, n, tfr, tt, toct, sd);
 
 #pragma omp parallel for schedule(static)
   for (int i = 0; i < n; i++) {
@@ -2422,7 +2511,8 @@ API void nv_sys_step(NvSys *s, float dt) {
     float tk = tamp * K[KP_turb];
     if (tk != 0.f) {
       float c[3];
-      curl_noise(x * tfr, y * tfr, z * tfr, tt, toct, sd, c);
+      if (baked) turb_lookup(s, x, y, z, c);
+      else curl_noise(x * tfr, y * tfr, z * tfr, tt, toct, sd, c);
       ax += c[0] * tk; ay += c[1] * tk; az += c[2] * tk;
     }
     float fk = K[KP_force];

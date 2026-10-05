@@ -105,6 +105,23 @@ def test_sdf_collider_voxelizes_like_sphere():
     assert abs(counts[0] - counts[1]) < 0.03 * counts[0]
 
 
+def test_turbulence_grid():
+    """Baked turbulence must match direct curl noise closely, and auto mode must only kick in when it pays."""
+    L = core.lib()
+    def field(mode, n, spread=5.0):
+        s = core.System(); s.set_params(dict(turb_amp=1.0, turb_freq=0.5, turb_octaves=2, gz=0, turb_speed=0))
+        s.set_kinds([dict(life_min=100, life_max=100, gravity=0)]); L.nv_sys_set_turb_grid(s.h, mode)
+        rng = np.random.default_rng(1); s.emit(0, rng.uniform(-spread, spread, (n, 3)), np.zeros((n, 3)))
+        s.frame(1e-3, 1); used = L.nv_sys_turb_grid_used(s.h); a = s.export()[1] / 1e-3; s.free()
+        return a, used
+    a, _ = field(-1, 200_000); b, used = field(1, 200_000)
+    err = np.sqrt(((a - b) ** 2).sum(1).mean() / (a ** 2).sum(1).mean())
+    _, small = field(0, 20_000)          # grid would be bigger than the particle count: stay direct
+    _, big = field(0, 1_000_000)         # grid is tiny next to 1M particles: bake
+    print(f"turbulence grid: {err*100:.2f}% RMS vs direct; auto off at 20k particles: {not small}, on at 1M: {bool(big)}")
+    assert used and err < 0.06 and not small and big
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and (len(sys.argv) < 2 or name in sys.argv[1:]):

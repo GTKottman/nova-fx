@@ -40,6 +40,8 @@ _SIGS = {
     "nv_sys_count": (C.c_int, [_vp]),
     "nv_emit": (C.c_int, [_vp, C.c_int, C.c_int, _f, _f, _f]),
     "nv_sys_step": (None, [_vp, C.c_float]),
+    "nv_sys_set_turb_grid": (None, [_vp, C.c_int]),
+    "nv_sys_turb_grid_used": (C.c_int, [_vp]),
     "nv_sys_write": (C.c_int, [_vp, C.c_char_p]),
     "nv_sys_export": (C.c_int, [_vp, _f, _f, _f, _f, _f]),
     "nv_fluid_new": (_vp, [C.c_int, C.c_int, C.c_int, C.c_float, C.c_float, C.c_float, C.c_float]),
