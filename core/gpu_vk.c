@@ -309,8 +309,12 @@ static void begin(GpuFluid *g) {
   g->recording = 1;
 }
 
+static long g_syncs;
+API long nv_gpu_sync_count(void) { return g_syncs; }
+
 static void flush(GpuFluid *g) {
   if (!g->recording) return;
+  g_syncs++;
   vkEndCommandBuffer_(g->cmd);
   VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
   si.commandBufferCount = 1;
@@ -842,8 +846,20 @@ static int bucket_upload(GpuFluid *g, int n, const float *pts6, int op, float R)
     free(idx);
     return -1;
   }
-  if (n) upload(g, &g->P, 0, pts6, (size_t)n * 6 * sizeof(float));
-  upload(g, &g->PI, 0, idx, nidx * sizeof(uint32_t));
+  size_t pb = (size_t)n * 6 * sizeof(float), ib = nidx * sizeof(uint32_t);
+  if (pb + ib <= g->stage.size) { /* both in one submit */
+    flush(g);
+    memcpy(g->stage.map, pts6, pb);
+    memcpy((char *)g->stage.map + pb, idx, ib);
+    begin(g);
+    VkBufferCopy c0 = {0, 0, pb}, c1 = {pb, 0, ib};
+    if (pb) vkCmdCopyBuffer_(g->cmd, g->stage.buf, g->P.buf, 1, &c0);
+    vkCmdCopyBuffer_(g->cmd, g->stage.buf, g->PI.buf, 1, &c1);
+    barrier(g); /* the gather dispatch that follows is recorded into the same submit */
+  } else {
+    if (n) upload(g, &g->P, 0, pts6, pb);
+    upload(g, &g->PI, 0, idx, ib);
+  }
   free(idx);
   return total ? 1 : 0;
 }
@@ -905,6 +921,26 @@ HIDDEN void gpuf_download(GpuFluid *g, int which, float *dst) {
   else if (which == 5) { off = g->v; n = g->nv; }
   else { off = g->w; n = g->nw; }
   download(g, &g->F, (VkDeviceSize)off * sizeof(float), dst, n * sizeof(float));
+}
+
+/* all three velocity components in one submit (particles that ride the flow) */
+HIDDEN void gpuf_download_velocity(GpuFluid *g, float *u, float *v, float *w) {
+  size_t bytes = (g->nu + g->nv + g->nw) * sizeof(float);
+  if (bytes > g->stage.size) {
+    gpuf_download(g, 4, u);
+    gpuf_download(g, 5, v);
+    gpuf_download(g, 6, w);
+    return;
+  }
+  begin(g);
+  VkBufferCopy cp[3] = {{(VkDeviceSize)g->u * 4, 0, g->nu * 4}, {(VkDeviceSize)g->v * 4, g->nu * 4, g->nv * 4},
+                        {(VkDeviceSize)g->w * 4, (g->nu + g->nv) * 4, g->nw * 4}};
+  for (int i = 0; i < 3; i++) vkCmdCopyBuffer_(g->cmd, g->F.buf, g->stage.buf, 1, &cp[i]);
+  barrier(g);
+  flush(g);
+  memcpy(u, g->stage.map, g->nu * 4);
+  memcpy(v, (char *)g->stage.map + g->nu * 4, g->nv * 4);
+  memcpy(w, (char *)g->stage.map + (g->nu + g->nv) * 4, g->nw * 4);
 }
 
 /* bounding box of tiles holding anything (cell units, end exclusive); returns 0 if empty */

@@ -63,6 +63,7 @@ WEAK void gpuf_splat(GpuFluid *g, int n, const float *pos, float radius, float d
                      const float *vel, float vel_amt, int mode);
 WEAK void gpuf_deposit(GpuFluid *g, int n, const float *pos, const float *amt);
 WEAK void gpuf_download(GpuFluid *g, int which, float *dst);
+WEAK void gpuf_download_velocity(GpuFluid *g, float *u, float *v, float *w);
 WEAK int gpuf_active_bbox(GpuFluid *g, int *b);
 WEAK void gpuf_stats(GpuFluid *g, int *iters, float *res, double *ms);
 
@@ -2885,11 +2886,8 @@ API void nv_frame(NvSys *s, NvFluid *f, float dt, int psub) {
       /* fluid steps spread evenly among particle substeps */
       double a = now_ms();
       fluid_substep(f, dt / fsub);
-      if (f->gpu && s && couple) { /* particles riding the flow read the CPU copy of the velocity */
-        gpuf_download(f->gpu, 4, f->u);
-        gpuf_download(f->gpu, 5, f->v);
-        gpuf_download(f->gpu, 6, f->w);
-      }
+      if (f->gpu && s && couple) /* particles riding the flow read the CPU copy of the velocity */
+        gpuf_download_velocity(f->gpu, f->u, f->v, f->w);
       fms += now_ms() - a;
     }
     if (s) nv_sys_step(s, h);
