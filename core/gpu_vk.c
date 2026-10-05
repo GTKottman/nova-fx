@@ -513,6 +513,7 @@ HIDDEN GpuFluid *gpuf_new(int nx, int ny, int nz, float dx, const float *o, int 
   g->small_from = nlev - 1;
   for (int l = nlev - 1; l >= 1; l--)
     if ((size_t)g->lx[l] * g->ly[l] * g->lz[l] <= SMALL_LEVEL_CELLS) g->small_from = l;
+  if (getenv("NOVA_GPU_NO_SMALL")) g->small_from = nlev; /* debugging: dispatch every level */
   size_t parts = cdiv((int)g->nc, 256) + cdiv(nx + 1, 8) * cdiv(ny + 1, 8) * cdiv(nz + 1, 4) + (size_t)g->nt + 64;
   g->r_npart = (uint32_t)parts;
   g->r_part = 128;
@@ -524,8 +525,9 @@ HIDDEN GpuFluid *gpuf_new(int nx, int ny, int nz, float dx, const float *o, int 
   ca.commandPool = G.pool;
   ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
   ca.commandBufferCount = 1;
-  if (vkAllocateCommandBuffers_(G.dev, &ca, &g->cmd) || buf_create(&g->F, off * sizeof(float), 0) ||
-      buf_create(&g->S, soff * sizeof(uint32_t), 0) || buf_create(&g->R, (128 + 2 * parts) * sizeof(float), 1) ||
+  size_t pad = getenv("NOVA_GPU_PAD") ? (size_t)atol(getenv("NOVA_GPU_PAD")) : 0; /* debugging */
+  if (vkAllocateCommandBuffers_(G.dev, &ca, &g->cmd) || buf_create(&g->F, (off + pad) * sizeof(float), 0) ||
+      buf_create(&g->S, (soff + pad) * sizeof(uint32_t), 0) || buf_create(&g->R, (128 + 2 * parts) * sizeof(float), 1) ||
       buf_create(&g->P, 4096, 0) || buf_create(&g->PI, 4096, 0) || buf_create(&g->stage, stage_bytes, 1)) {
     gpuf_free(g);
     return NULL;
@@ -542,6 +544,11 @@ HIDDEN GpuFluid *gpuf_new(int nx, int ny, int nz, float dx, const float *o, int 
   begin(g);
   vkCmdFillBuffer_(g->cmd, g->F.buf, 0, VK_WHOLE_SIZE, 0);
   vkCmdFillBuffer_(g->cmd, g->S.buf, 0, VK_WHOLE_SIZE, 0);
+  if (pad && getenv("NOVA_GPU_CANARY")) { /* debugging: poison the padding to catch reads past the end */
+    vkCmdFillBuffer_(g->cmd, g->F.buf, off * sizeof(float), pad * sizeof(float), 0x7149F2CAu); /* 1e30f */
+    vkCmdFillBuffer_(g->cmd, g->S.buf, soff * sizeof(uint32_t), pad * sizeof(uint32_t),
+                     (uint32_t)atol(getenv("NOVA_GPU_CANARY")));
+  }
   barrier(g);
   flush(g);
   float *R = (float *)g->R.map;
@@ -770,6 +777,7 @@ static void add_forces(GpuFluid *g, uint32_t U, uint32_t V, uint32_t W, float dt
     p.f0[1] = 0.5f / g->dx;
     disp(g, SH_forces, &p, gx, gy, gz);
     pc_init(&p, nx, ny, nz, 2);
+    p.o0[0] = U; p.o0[1] = V; p.o0[2] = W; /* local speed limits the noise push */
     p.o0[3] = g->sc;
     p.o1[0] = g->tmp; p.o1[1] = g->sc + (uint32_t)g->nc; p.o1[2] = g->perm_off;
     p.o1[3] = (uint32_t)fp[FP_seed] * 7919u + 17u;
@@ -797,6 +805,7 @@ static void faces_op(GpuFluid *g, int op, uint32_t dU, uint32_t dV, uint32_t dW,
   PC p;
   pc_init(&p, g->nx, g->ny, g->nz, op);
   p.o0[0] = dU; p.o0[1] = dV; p.o0[2] = dW; p.o1[0] = sU; p.o1[1] = sV; p.o1[2] = sW;
+  p.o2[0] = g->lst[0];
   p.f0[0] = f;
   disp(g, SH_faces, &p, cdiv(g->nx + 1, 8), cdiv(g->ny + 1, 8), cdiv(g->nz + 1, 4));
 }

@@ -20,9 +20,21 @@ void main() {
     if (cv) F[pc.o0.y + iv] = F[pc.o1.y + iv];
     if (cw) F[pc.o0.z + iw] = F[pc.o1.z + iw];
   } else if (op == 1) {
-    if (cu) F[pc.o0.x + iu] = 2.0 * F[pc.o1.x + iu] - F[pc.o0.x + iu];
-    if (cv) F[pc.o0.y + iv] = 2.0 * F[pc.o1.y + iv] - F[pc.o0.y + iv];
-    if (cw) F[pc.o0.z + iw] = 2.0 * F[pc.o1.z + iw] - F[pc.o0.z + iw];
+    // reflect only between two fluid cells (see faces_op in nova_core.c); o2.x = level-0 stencil
+    uint st = pc.o2.x;
+    bool here = g.x < nx && g.y < ny && g.z < nz && (S[st + cidx(g.x, g.y, g.z)] & 255u) != 0u;
+    if (cu) {
+      bool fl = here && g.x > 0 && (S[st + cidx(g.x - 1, g.y, g.z)] & 255u) != 0u;
+      F[pc.o0.x + iu] = fl ? 2.0 * F[pc.o1.x + iu] - F[pc.o0.x + iu] : F[pc.o1.x + iu];
+    }
+    if (cv) {
+      bool fl = here && g.y > 0 && (S[st + cidx(g.x, g.y - 1, g.z)] & 255u) != 0u;
+      F[pc.o0.y + iv] = fl ? 2.0 * F[pc.o1.y + iv] - F[pc.o0.y + iv] : F[pc.o1.y + iv];
+    }
+    if (cw) {
+      bool fl = here && g.z > 0 && (S[st + cidx(g.x, g.y, g.z - 1)] & 255u) != 0u;
+      F[pc.o0.z + iw] = fl ? 2.0 * F[pc.o1.z + iw] - F[pc.o0.z + iw] : F[pc.o1.z + iw];
+    }
   } else if (op == 2) {
     float m = pc.f0.x;
     if (cu) F[pc.o0.x + iu] = clamp(F[pc.o0.x + iu], -m, m);
