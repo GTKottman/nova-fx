@@ -1669,6 +1669,15 @@ API void nv_fluid_timings(NvFluid *f, float *o) {
   f->tm_adv = f->tm_frc = f->tm_prj = f->tm_cmb = 0;
 }
 
+/* test / benchmark hook: only the scalar advection of one substep (CPU reference for the GPU path) */
+API double nv_fluid_bench_advect(NvFluid *f, float dt, int iters) {
+  ftz();
+  update_tiles(f);
+  double t0 = now_ms();
+  for (int i = 0; i < iters; i++) advect_scalars(f, f->u, f->v, f->w, dt);
+  return (now_ms() - t0) / iters;
+}
+
 API void nv_fluid_step(NvFluid *f, float dt) {
   ftz();
   double t0 = now_ms();

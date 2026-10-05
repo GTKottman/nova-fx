@@ -67,22 +67,27 @@ def build(force=False):
     """Compile the core for this CPU (gcc/clang + OpenMP). Returns (ok, log)."""
     if os.path.exists(LIB_PATH) and not force:
         return True, "already built"
-    src = SRC_PATH
-    if not os.path.exists(src):
-        alt = os.path.join(HERE, "..", "..", "core", "nova_core.c")
-        src = alt if os.path.exists(alt) else src
+    src_dir = os.path.dirname(SRC_PATH)
+    if not os.path.exists(SRC_PATH):
+        alt = os.path.join(HERE, "..", "..", "core")
+        src_dir = alt if os.path.exists(os.path.join(alt, "nova_core.c")) else src_dir
+    sources = [os.path.join(src_dir, "nova_core.c")]
+    if os.path.exists(os.path.join(src_dir, "gpu_vk.c")) and os.path.exists(os.path.join(src_dir, "shaders_spv.h")):
+        sources.append(os.path.join(src_dir, "gpu_vk.c"))
     log = []
-    for cc in ("gcc", "clang", "cc"):
-        cmd = [cc, "-O3", "-march=native", "-ffast-math", "-fno-math-errno", "-fopenmp", "-fPIC",
-               "-fvisibility=hidden", "-shared", "-o", LIB_PATH, src, "-lm"]
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        except (OSError, subprocess.TimeoutExpired) as e:
-            log.append(f"{cc}: {e}")
-            continue
-        log.append(r.stderr)
-        if r.returncode == 0:
-            return True, "\n".join(log)
+    # with the GPU backend first; without it if this machine has no Vulkan headers
+    for srcs in ([*sources], sources[:1]) if len(sources) > 1 else (sources,):
+        for cc in ("gcc", "clang", "cc"):
+            cmd = [cc, "-O3", "-march=native", "-ffast-math", "-fno-math-errno", "-fopenmp", "-fPIC",
+                   "-fvisibility=hidden", "-shared", "-o", LIB_PATH, *srcs, "-lm", "-ldl"]
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            except (OSError, subprocess.TimeoutExpired) as e:
+                log.append(f"{cc}: {e}")
+                continue
+            log.append(r.stderr)
+            if r.returncode == 0:
+                return True, "\n".join(log)
     return False, "\n".join(log)
 
 

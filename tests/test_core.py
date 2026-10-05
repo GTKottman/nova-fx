@@ -122,6 +122,34 @@ def test_turbulence_grid():
     assert used and err < 0.06 and not small and big
 
 
+def test_gpu_advection_matches_cpu():
+    """Vulkan MacCormack advection vs the CPU solver on the same field (skipped without a Vulkan GPU)."""
+    import ctypes as C
+    L = core.lib()
+    if not hasattr(L, "nv_gpu_init"):
+        print("gpu: skipped, core built without the Vulkan backend"); return
+    L.nv_gpu_init.restype = C.c_int; L.nv_gpu_name.restype = C.c_char_p
+    if L.nv_gpu_init() != 0:
+        print("gpu: skipped,", L.nv_gpu_name().decode()); return
+    L.nv_fluid_bench_advect.restype = C.c_double; L.nv_fluid_bench_advect.argtypes = [C.c_void_p, C.c_float, C.c_int]
+    L.nv_gpu_bench_advect.argtypes = [C.c_int] * 3 + [C.c_float] + [C.c_void_p] * 5 + [C.c_int, C.c_void_p]
+    n, dx, dt = 64, 0.03, 1 / 48
+    f = core.Fluid((n, n, n), dx, (0, 0, 0)); f.set_params(dict(sparse=0, maccormack=1))
+    arr = lambda which, size: np.ctypeslib.as_array(L.nv_fluid_ptr(f.h, which), shape=(size,))
+    u, v, w = arr(4, n * n * (n + 1)), arr(5, n * n * (n + 1)), arr(6, n * n * (n + 1))
+    u[:] = np.sin(np.arange(u.size) * 0.001) * 2; v[:] = np.cos(np.arange(v.size) * 0.0013) * 2; w[:] = 1.5
+    z, y, x = np.mgrid[0:n, 0:n, 0:n]
+    d = f.field(0); d[:] = np.exp(-(((x - n / 2) ** 2 + (y - n / 2) ** 2 + (z - n / 3) ** 2) / (n / 6) ** 2))
+    src = d.copy(); L.nv_fluid_bench_advect(f.h, dt, 1); cpu = f.field(0).copy()
+    out = np.empty_like(src); t = (C.c_double * 3)()
+    uu, vv, ww = u.copy(), v.copy(), w.copy()
+    assert L.nv_gpu_bench_advect(n, n, n, dt / dx, uu.ctypes.data, vv.ctypes.data, ww.ctypes.data,
+                                 src.ctypes.data, out.ctypes.data, 10, t) == 0
+    err = np.abs(out - cpu).max()
+    print(f"gpu ({L.nv_gpu_name().decode()}): advection matches CPU to {err:.1e}, {t[1]:.2f} ms per field at 64^3")
+    assert err < 1e-5
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and (len(sys.argv) < 2 or name in sys.argv[1:]):
