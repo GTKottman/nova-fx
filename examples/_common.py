@@ -20,6 +20,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ARGS = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
 QUICK = "--quick" in ARGS
 OUT = ARGS[ARGS.index("--out") + 1] if "--out" in ARGS else os.path.join(ROOT, "docs", "examples")
+# caches and frames go to disk, not tempfile.gettempdir(): /tmp is often RAM-backed and a 128^3 fire
+# writes gigabytes of VDBs
+WORK = os.path.join(os.path.expanduser("~"), ".cache", "nova-fx-examples")
 
 
 def start(frame_end=250, fps=24):
@@ -42,7 +45,7 @@ def add(preset, cache_name):
     """Add a preset with camera, night sky and glow; cache into a temp folder."""
     bpy.ops.nova.add_preset(preset=preset, setup_scene=True)
     so = bpy.context.object
-    so.nova.cache_dir = os.path.join(tempfile.gettempdir(), "nova_examples", cache_name) + "/"
+    so.nova.cache_dir = os.path.join(WORK, "cache", cache_name) + "/"
     nova("sim").free_cache(so)
     bpy.context.scene.frame_set(so.nova.frame_start)  # restart the live simulation in the new cache
     return so
@@ -108,7 +111,23 @@ def _render(path, percentage):
     sc = bpy.context.scene
     sc.render.resolution_percentage = percentage
     sc.render.filepath = path
-    bpy.ops.render.render(write_still=True)
+    try:
+        bpy.ops.render.render(write_still=True)
+    except RuntimeError as e:
+        if sc.cycles.device != "GPU" or "memory" not in str(e).lower():
+            raise
+        # other programs hold the GPU: finish this scene on the CPU (same image, slower)
+        print("GPU is out of memory; rendering the rest of this scene on the CPU", flush=True)
+        sc.cycles.device = "CPU"
+        bpy.context.preferences.addons["cycles"].preferences.compute_device_type = "NONE"
+        sc.cycles.denoiser = "OPENIMAGEDENOISE"     # the OptiX denoiser needs the GPU too
+        if hasattr(sc.cycles, "denoising_use_gpu"):
+            sc.cycles.denoising_use_gpu = False
+        if hasattr(sc.render, "compositor_device"):
+            sc.render.compositor_device = "CPU"
+        sc.render.threads_mode = "FIXED"           # leave a few cores for whatever else is running
+        sc.render.threads = max(1, (os.cpu_count() or 4) - 4)
+        bpy.ops.render.render(write_still=True)
     sc.render.resolution_percentage = 100
 
 
@@ -122,7 +141,8 @@ def still(name, sysobs, frame):
     """Simulate to `frame` and render one full-size image."""
     os.makedirs(OUT, exist_ok=True)
     advance(sysobs, frame)
-    tmp = os.path.join(tempfile.gettempdir(), f"nova_{name}.png")
+    os.makedirs(WORK, exist_ok=True)
+    tmp = os.path.join(WORK, f"{name}.png")
     t = time.perf_counter()
     _render(tmp, 100)
     out = _jpg(tmp, name)
@@ -136,7 +156,8 @@ def loop(name, sysobs, first, last, step=1, width=640, fps=24, still_at=None):
     call this once per scene, from the earliest frame you need."""
     os.makedirs(OUT, exist_ok=True)
     sc = bpy.context.scene
-    d = tempfile.mkdtemp(prefix=f"nova_{name}_")
+    os.makedirs(WORK, exist_ok=True)
+    d = tempfile.mkdtemp(prefix=f"{name}_", dir=WORK)
     t = time.perf_counter()
     n = 0
     for f in range(first, last + 1):

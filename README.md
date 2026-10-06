@@ -33,7 +33,7 @@ make -C core
 |---|---|
 | Fireworks Show | 11 shell types: peony, chrysanthemum, willow, palm, ring, crossette, crackle, strobe, heart, multicolour, colour change |
 | Sparkler | Iron sparks that fork in flight (split events), incandescent colour |
-| Campfire | Combustion fluid, embers riding the flow, popping sparks |
+| Campfire | Combustion fluid, embers riding the flow, popping sparks, logs with glowing cracks |
 | Torch | Small licking flame |
 | Explosion | Fuel burst with volume expansion, fireball into rolling smoke, debris that trails smoke into the grid |
 | Grinder Sparks | Directional spray that bounces and spatters on impact |
@@ -43,6 +43,93 @@ make -C core
 | Energy Vortex | Vortex + attractor forces, streak display |
 | Snow | Lit flakes that settle |
 | Empty System | Starting point |
+
+## Examples
+
+Every example below is a script in [`examples/`](examples) that builds the whole scene from an empty
+file, simulates it and renders it. Run one headless with
+`blender -b --factory-startup --python examples/<name>.py`. Add `-- --quick` for a fast, low-quality pass.
+
+<table>
+<tr>
+<td width="50%"><img src="docs/examples/fireworks_lake.webp" alt="Fireworks over a lake"><br>
+<b>Fireworks over a lake</b>: eleven shell types, colours from real metal-salt emission lines,
+reflections in rippled water. <a href="examples/fireworks_lake.py">fireworks_lake.py</a></td>
+<td width="50%"><img src="docs/examples/sparkler_bokeh.webp" alt="Sparkler close-up"><br>
+<b>Sparkler close-up</b>: iron sparks that fork in flight (split events), incandescent Planck colour,
+85 mm depth of field. <a href="examples/sparkler_bokeh.py">sparkler_bokeh.py</a></td>
+</tr>
+<tr>
+<td><img src="docs/examples/campfire_night.webp" alt="Campfire at night"><br>
+<b>Campfire at night</b>: combustion on the GPU solver, embers riding the flow, a stone ring lit by
+the fire. <a href="examples/campfire_night.py">campfire_night.py</a></td>
+<td><img src="docs/examples/explosion_sequence.webp" alt="Explosion"><br>
+<b>Explosion</b>: expanding fuel burst into a rolling fireball and smoke cloud; debris trails sparks and
+smoke of its own. <a href="examples/explosion_sequence.py">explosion_sequence.py</a></td>
+</tr>
+<tr>
+<td><img src="docs/examples/grinder_monkey.webp" alt="Sparks on a mesh collider"><br>
+<b>Sparks on a mesh</b>: an exact mesh collider (distance field) with continuous collision, so sparks
+don't pass through the thin ears. <a href="examples/grinder_monkey.py">grinder_monkey.py</a></td>
+<td><img src="docs/examples/magic_wand.webp" alt="Magic wand"><br>
+<b>Magic wand</b>: a twinkling trail that shifts colour, swirled by divergence-free curl noise.
+<a href="examples/magic_wand.py">magic_wand.py</a></td>
+</tr>
+<tr>
+<td><img src="docs/examples/meteor_shower.webp" alt="Meteor shower"><br>
+<b>Meteor shower</b>: a custom effect written from scratch (below), with no preset involved.
+<a href="examples/meteor_shower.py">meteor_shower.py</a></td>
+<td><img src="docs/presets.png" alt="All presets"><br>
+<b>Every preset</b> straight out of <i>Add Effect</i>, untouched.</td>
+</tr>
+</table>
+
+Full-size stills sit next to each loop as `docs/examples/<name>.jpg`.
+
+### Build an effect in Python
+
+Particle types are the building blocks. Each type has a lifetime, motion, a light model, and *events*
+that spawn other types: on death, along a trail, on a split, or on impact. This is the whole meteor
+shower above:
+
+```python
+import bpy, math
+
+bpy.ops.nova.add_preset(preset="EMPTY")      # an empty system + one emitter
+sky = bpy.context.object
+n = sky.nova
+n.kinds.clear()
+
+def kind(**settings):
+    k = n.kinds.add()
+    for key, value in settings.items():
+        setattr(k, key, value)
+    return k
+
+# hot rock: Planck colour, leaves a trail, bursts into sparks when it hits something
+kind(name="Meteor", color_mode="BLACKBODY", temp0=3200, life_min=3, life_max=4, emit=60, collide="DIE",
+     size_start=0.06, size_end=0.04, trail_kind="Trail", trail_rate=180, hit_kind="Spark", hit_count=60, hit_speed=9)
+kind(name="Trail", color_mode="BLACKBODY", temp0=2400, cool=1.8, life_min=0.5, life_max=1.2,
+     size_start=0.035, size_end=0.0, emit=25, drag_lin=1.5, gravity=0.2, collide="NONE")
+kind(name="Spark", color_mode="BLACKBODY", temp0=2600, cool=1.5, life_min=0.6, life_max=1.6,
+     size_start=0.02, size_end=0.006, emit=40, drag_quad=0.5, collide="BOUNCE", bounce=0.35,
+     split_kind="Spark", split_rate=1.5, split_count=2, split_max_gen=1)
+n.display = "STREAKS"
+
+em = bpy.data.objects["Nova Emitter"]                # meteors enter high up, aimed down and across
+em.location = (-14, 30, 26)
+em.rotation_euler = (math.radians(130), 0, math.radians(35))
+e = em.nova_emitter
+e.kind, e.shape, e.radius = "Meteor", "SPHERE", 6.0
+e.rate, e.random_timing, e.speed, e.spread = 2.2, True, 26, math.radians(6)
+
+bpy.ops.mesh.primitive_plane_add(size=200)          # anything can be a collider
+ground = bpy.context.object
+ground.nova_collider.enabled = True
+```
+
+Press Play to watch it live, or *Bake* to cache it to disk. The same settings appear in the sidebar
+(**N → Nova FX**), so you can build effects there and script them later, or the other way round.
 
 ## What it does, and how
 
@@ -84,8 +171,11 @@ make -C core
 - **Advection:**
   - MacCormack with min/max clamping (Selle et al. 2008)
   - advection–reflection (Zehnder, Narain, Thomaszewski 2018), which keeps the swirl energy
-    semi-Lagrangian steps lose
-- **Vorticity confinement** plus curl-noise detail.
+    semi-Lagrangian steps lose. It reflects only between two fluid cells.
+  - Where a trace leaves the grid, the step falls back to semi-Lagrangian, so open walls stay stable
+    (a 128³ fire in a narrow domain holds ~3 m/s for 200 frames)
+- **Vorticity confinement** plus curl-noise detail. The noise fades out as the local flow approaches
+  half its amplitude, so it adds detail without pumping energy in forever.
 - **Combustion:**
   - fuel, ignition temperature, Arrhenius-like burn rate
   - heat release and smoke yield
@@ -108,9 +198,9 @@ make -C core
 ### GPU fluid (Vulkan)
 - **Setting:** `Fire & Smoke → Device: GPU` runs the whole fluid substep in Vulkan compute (`core/gpu_vk.c`,
   `core/shaders/*.comp`) with the state resident in VRAM.
-- **Same solver:** it mirrors the CPU one kernel for kernel, and the tests check that. Identical after one frame,
-  within 0.0012% after eight.
-- **Pressure solve:** MGPCG with the CG scalars kept on the GPU. The host syncs once per batch of 4 iterations.
+- **Same solver:** it mirrors the CPU one kernel for kernel, and the tests check that: identical after one frame,
+  and after eight frames no cell off by more than 0.5% of peak. Repeated runs give bit-identical results.
+- **Pressure solve:** MGPCG with the CG scalars kept on the GPU. The host syncs once per batch of 6 iterations.
 - **Sources and deposits:** bucketed by tile on the CPU and gathered per cell on the GPU. No atomics, so results
   are deterministic.
 - **Transfers:** the CPU keeps the bookkeeping (solids, multigrid stencils, which are uploaded only when they

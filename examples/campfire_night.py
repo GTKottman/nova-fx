@@ -13,7 +13,7 @@ sc.frame_set(fire.nova.frame_start)        # restart with the new grid
 
 # a ring of rough stones around the logs
 rng = random.Random(11)
-stone = material("Stone", (0.16, 0.15, 0.14), rough=0.85)
+stone = material("Stone", (0.32, 0.30, 0.28), rough=0.8)
 for i in range(11):
     a = i / 11 * 2 * math.pi + rng.uniform(-0.1, 0.1)
     me = bpy.data.meshes.new("stone")
@@ -41,8 +41,8 @@ bsdf = next(n for n in nt.nodes if n.type == "BSDF_PRINCIPLED")
 noise = nt.nodes.new("ShaderNodeTexNoise")
 noise.inputs["Scale"].default_value = 18.0
 ramp = nt.nodes.new("ShaderNodeValToRGB")
-ramp.color_ramp.elements[0].color = (0.03, 0.022, 0.018, 1)
-ramp.color_ramp.elements[1].color = (0.09, 0.07, 0.05, 1)
+ramp.color_ramp.elements[0].color = (0.07, 0.055, 0.045, 1)
+ramp.color_ramp.elements[1].color = (0.17, 0.13, 0.10, 1)
 nt.links.new(noise.outputs["Fac"], ramp.inputs["Fac"])
 nt.links.new(ramp.outputs["Color"], bsdf.inputs["Base Color"])
 g.data.materials.clear()
@@ -60,4 +60,5 @@ cam.location = (0.0, -2.35, 0.42)
 look_at(cam, (0, 0, 0.62))
 cam.data.lens = 32
 render_settings(res=(1280, 720), samples=96)
+sc.view_settings.exposure = -0.8            # keep the flame core from clipping to white
 loop("campfire_night", [fire], 72, 119, step=1, width=640, still_at=104)

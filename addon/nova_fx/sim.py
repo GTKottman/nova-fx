@@ -215,7 +215,7 @@ def collider_records(rt, scene, dt, depsgraph=None, frame=0):
         lo, hi = bb.min(0), bb.max(0)
         center = (lo + hi) / 2
         half = np.maximum((hi - lo) / 2, 1e-4)
-        mw = ob.matrix_world.copy()
+        mw = world_matrix(ob, depsgraph)
         if c.shape == "MESH" and ob.type == "MESH" and depsgraph is not None:
             slot = ensure_sdf(rt, ob, depsgraph, frame)
             local = mw
@@ -238,14 +238,20 @@ def collider_records(rt, scene, dt, depsgraph=None, frame=0):
     return recs
 
 
-def force_records(scene):
+def world_matrix(ob, depsgraph):
+    """The object's evaluated transform. The original's matrix_world isn't always written back
+    (e.g. F-curve modifiers such as Cycles), so read the evaluated copy whenever a depsgraph is at hand."""
+    return (ob.evaluated_get(depsgraph) if depsgraph is not None else ob).matrix_world.copy()
+
+
+def force_records(scene, depsgraph=None):
     types = {"ATTRACT": 0, "VORTEX": 1, "WIND": 2, "TURBULENCE": 3, "DRAG": 4}
     recs = []
     for ob in scene.objects:
         f = ob.nova_force
         if not f.enabled:
             continue
-        mw = ob.matrix_world
+        mw = world_matrix(ob, depsgraph)
         axis = (mw.to_3x3() @ Vector((0, 0, 1))).normalized()
         recs.append([types[f.type], *mw.to_translation(), *axis, f.strength, f.radius, f.freq, f.falloff])
     return recs
@@ -348,7 +354,7 @@ def emit_frame(rt, scene, sysob, frame, dt, depsgraph):
     for ei, ob in enumerate(emitters_of(scene, sysob)):
         em = ob.nova_emitter
         st = rt.em_state.setdefault(ob.name, {"carry": 0.0})
-        cur = ob.matrix_world.copy()
+        cur = world_matrix(ob, depsgraph)
         prev = st.get("prev", cur)
         st["prev"] = cur
         kind = names.index(em.kind) if em.kind in names else -1
@@ -452,13 +458,13 @@ def step(scene, sysob, frame, depsgraph=None, write=True):
         reset(rt, scene, sysob)
         apply_params(rt, scene, sysob)
         rt.sys.set_colliders(collider_records(rt, scene, dt, depsgraph, frame))
-        rt.sys.set_forces(force_records(scene))
+        rt.sys.set_forces(force_records(scene, depsgraph))
         emit_frame(rt, scene, sysob, frame, dt, depsgraph)
     else:
         ensure_fluid(rt, sysob)
         apply_params(rt, scene, sysob)
         rt.sys.set_colliders(collider_records(rt, scene, dt, depsgraph, frame))
-        rt.sys.set_forces(force_records(scene))
+        rt.sys.set_forces(force_records(scene, depsgraph))
         # sources first (they feed this frame's fluid step), then move, then the new births
         rt.sys.frame(dt, n.substeps, rt.fluid)
         emit_frame(rt, scene, sysob, frame, dt, depsgraph)
