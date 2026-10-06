@@ -855,6 +855,13 @@ static void advect_scalar(NvFluid *f, const float *src, float *hat, const float 
   }
 }
 
+/* MacCormack's error estimate is meaningless where a trace leaves the grid (the samples are clamped,
+ * so back and forward traces don't retrace each other); there the face falls back to semi-Lagrangian.
+ * Without this, faces at open boundaries amplify a little every step and a narrow domain blows up. */
+static inline int outside(float x, float y, float z, int sx, int sy, int sz) {
+  return x < 0.f || y < 0.f || z < 0.f || x > (float)(sx - 1) || y > (float)(sy - 1) || z > (float)(sz - 1);
+}
+
 /* advect one face component over the pressure tiles (copy-through outside the advection tiles).
  * comp 0=u 1=v 2=w. U,V,W = tracing velocity. */
 static void advect_face(NvFluid *f, int comp, const float *src, float *dst, const float *U, const float *V,
@@ -880,6 +887,7 @@ static void advect_face(NvFluid *f, int comp, const float *src, float *dst, cons
           trace(f, U, V, W, i + ox, j + oy, k + oz, h, p);
           float mn, mx;
           dst[c] = samp_mm(src, sx, sy, sz, p[0] - ox, p[1] - oy, p[2] - oz, 0, &mn, &mx);
+          if (outside(p[0] - ox, p[1] - oy, p[2] - oz, sx, sy, sz)) mn = INFINITY, mx = -INFINITY; /* forces SL */
           mnA[c] = mn;
           mxA[c] = mx;
         }
@@ -898,7 +906,8 @@ static void advect_face(NvFluid *f, int comp, const float *src, float *dst, cons
           trace(f, U, V, W, i + ox, j + oy, k + oz, -h, p);
           float til = samp(dst, sx, sy, sz, p[0] - ox, p[1] - oy, p[2] - oz, 0);
           float val = dst[c] + 0.5f * (src[c] - til);
-          mnA[c] = (val < mnA[c] || val > mxA[c]) ? dst[c] : val;
+          int sl = val < mnA[c] || val > mxA[c] || outside(p[0] - ox, p[1] - oy, p[2] - oz, sx, sy, sz);
+          mnA[c] = sl ? dst[c] : val;
         }
   }
 #pragma omp parallel for schedule(dynamic, 1)
