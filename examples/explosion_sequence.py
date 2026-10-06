@@ -10,6 +10,8 @@ boom = add("EXPLOSION", "explosion_sequence")
 boom.nova.fluid.resolution = 128
 boom.nova.fluid.device = "GPU"          # CPU fallback without Vulkan
 sc.frame_set(boom.nova.frame_start)
+boom.nova.display = "STREAKS"             # debris and its trail sparks as motion streaks, not dots
+boom.nova.streak_length = 0.03
 
 ground = bpy.data.objects["Nova Ground"]
 ground.data.materials.clear()
@@ -42,4 +44,4 @@ cam.location = (0, -27, 2.2)
 look_at(cam, (0, 0, 4.6))
 cam.data.lens = 30
 render_settings(res=(1280, 720), samples=96)
-loop("explosion_sequence", [boom], 1, 96, step=2, width=640, still_at=22)
+loop("explosion_sequence", [boom], 1, 96, step=2, width=640, still_at=34)  # still: the rolling fireball
