@@ -84,7 +84,7 @@ class NOVA_PT_system(_Panel, bpy.types.Panel):
         if st:
             c.label(text=f"Particles {st['particle_ms']:.1f} ms · frame {st['frame_ms']:.0f} ms")
             if st.get("device"):
-                c.label(text=st["device"], icon="CHECKMARK" if st["device"].startswith("GPU:") else "ERROR")
+                c.label(text=st["device"], icon="CHECKMARK" if st["device"].startswith("GPU:") else "INFO")
             if st.get("cells"):
                 c.label(text=f"Fluid {st['fluid_ms']:.0f} ms · {st['cg_iters']} pressure iterations")
                 where = "on the GPU" if str(st.get("device", "")).startswith("GPU:") else "on the CPU"
