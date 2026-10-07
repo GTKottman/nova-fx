@@ -42,6 +42,7 @@ make -C core
 | Drifting Embers | Buoyant embers in wind |
 | Energy Vortex | Vortex + attractor forces, streak display |
 | Snow | Lit flakes that settle |
+| Lightning | Cloud-to-ground strike grown by the dielectric breakdown model: stepped leader, return strokes, cooling afterglow, impact spatter. With *Camera, World & Glow*, a cloud deck the flash lights from inside |
 | Empty System | Starting point |
 
 ## Examples
@@ -225,6 +226,37 @@ Wall time per frame, small plume in a growing empty domain (`bench/fluid_devices
 
 A wide fire that fills ~40% of a 6.1M-cell domain: CPU sparse 862 ms, GPU dense 165 ms, GPU sparse 61 ms.
 
+### Lightning
+- **Growth (`nv_lightning`):** the dielectric breakdown model (Niemeyer, Pietronero & Wiesmann 1984), the
+  Laplacian growth real leaders follow.
+  - It is grown with the fast method of Kim, Sewall, Sen & Lin (2007). Every channel point is a charge, so the
+    potential at each candidate site is a running sum, updated in O(candidates) per step instead of one Poisson
+    solve per step.
+  - A candidate joins with probability φ^η. Here φ blends the normalized charge potential (tips reach into high
+    potential, which is what makes branches) with the field toward the ground or a strike target.
+  - Within striking distance, the gap closes in one straight jump, as when an upward streamer meets the leader.
+  - Deterministic per seed. ~850 steps in about 20 ms.
+- **Shape:**
+  - Side branches with tiny subtrees are pruned.
+  - The tree is split into polylines, main channel first.
+  - The lattice is broken up with jitter and fractal midpoint kinks.
+  - The result is written to a Curves object with per-point attributes: `nova_birth` (when the leader got
+    there), `nova_main` and `nova_weight` (the branch's share of the current).
+- **Timeline:** keyframed on the material and two flash lights (in the cloud and low on the channel), so it
+  renders anywhere without handlers.
+  - The stepped leader comes down faint, with bright tips.
+  - The return stroke floods the channel and its branches.
+  - Re-strikes run down the main channel only, as dart leaders do.
+  - The channel cools from plasma temperature to 3000 K, evenly on a reciprocal (mired) scale.
+- **Controls:**
+  - Shape: seed, branching (η 16 → 8), directness (field weight), step, minimum branch size, fractal detail,
+    radius.
+  - Timing: strike frame, leader frames, strokes, gap, afterglow.
+  - Look: brightness, branch glow, temperature, flash power.
+  - Strike target object, and a Nova emitter that bursts at the strike point.
+- **Example:** [`examples/lightning_storm.py`](examples/lightning_storm.py) is a storm with three strikes, one
+  of them drawn to a lightning rod on a mast.
+
 ### Blender side
 - Native **PointCloud** objects with these attributes: `position`, `radius`, `Cd`, `emit`, `velocity`
   (Cycles motion blur), `age`, `id`, `kind`. Usable in your own shaders and Geometry Nodes.
@@ -262,6 +294,7 @@ Same plume, empty domain grown from 64³ to 256³ (old → now):
 ```
 python3 tests/test_core.py                                     # core: correctness + speed, ~7 s
 blender -b --factory-startup --python tests/blender_presets.py -- --frames 24
+blender -b --factory-startup --python tests/blender_lightning.py   # bolt controls, target, timeline
 blender -b --factory-startup --python tests/blender_render.py -- FIREWORKS 260 out.png CYCLES 64
 ```
 

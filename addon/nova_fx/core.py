@@ -60,6 +60,7 @@ _SIGS = {
     "nv_fluid_timings": (None, [_vp, _f]),
     "nv_frame": (None, [_vp, _vp, C.c_float, C.c_int]),
     "nv_stats": (None, [_vp, _vp, _f]),
+    "nv_lightning": (C.c_int, [_f, C.c_int, _f, C.POINTER(C.c_int)]),
 }
 
 _lib = None

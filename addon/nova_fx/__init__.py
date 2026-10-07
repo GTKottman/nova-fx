@@ -2,7 +2,7 @@
 
 import bpy
 
-from . import ops, props, sim, ui
+from . import lightning, ops, props, sim, ui
 
 
 class NovaPreferences(bpy.types.AddonPreferences):
@@ -35,6 +35,7 @@ def _apply_threads(prefs):
 
 def register():
     props.register()
+    lightning.register()
     bpy.utils.register_class(NovaPreferences)
     for c in ops.CLASSES + ui.CLASSES:
         bpy.utils.register_class(c)
@@ -48,4 +49,5 @@ def unregister():
     for c in reversed(ops.CLASSES + ui.CLASSES):
         bpy.utils.unregister_class(c)
     bpy.utils.unregister_class(NovaPreferences)
+    lightning.unregister()
     props.unregister()

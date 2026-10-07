@@ -3095,3 +3095,160 @@ API int nv_sys_export(NvSys *s, float *P3, float *V3, float *C3, float *R, float
   }
   return n;
 }
+
+/* ======================================================================== lightning */
+
+/* Dielectric breakdown model (Niemeyer, Pietronero & Wiesmann 1984) grown with the fast Laplacian-growth
+ * method of Kim, Sewall, Sen & Lin (2007): every channel point is a unit charge, so the potential at a
+ * candidate site is a running sum of (1 - R1/r) updated in O(candidates) per new point, instead of one
+ * Poisson solve per step. Growth picks a candidate with probability phi^eta, where phi blends the
+ * normalized charge potential (tips reach into high potential, which is what makes branches) with the
+ * background field toward the goal: the ground plane, or a strike target. Lattice spacing h,
+ * 26-neighbourhood, deterministic for a seed. Within striking distance (3 steps) of the goal the gap closes in
+ * one straight jump, as when an upward streamer from the ground or a rod meets the leader.
+ * p = (start x, y, z, ground z, h, eta, field weight, seed, target on, target x, y, z).
+ * Writes pos (3 per node) and parent (-1 for the root); node order is growth order, and the last node is
+ * the strike point. Returns the node count, negated if the bolt ran out of nodes before reaching the goal. */
+#define LN_R1 0.5
+typedef struct {
+  uint64_t *key;
+  size_t mask;
+} LnSet;
+
+static inline uint64_t ln_key(int i, int j, int k) {
+  return ((uint64_t)(i + (1 << 20)) << 42) | ((uint64_t)(j + (1 << 20)) << 21) | (uint64_t)(k + (1 << 20));
+}
+
+/* insert; returns 1 if it was new */
+static int ln_insert(LnSet *s, uint64_t key) {
+  size_t h = (size_t)(key * 0x9E3779B97F4A7C15ull) & s->mask;
+  while (s->key[h]) {
+    if (s->key[h] == key) return 0;
+    h = (h + 1) & s->mask;
+  }
+  s->key[h] = key;
+  return 1;
+}
+
+API int nv_lightning(const float *p, int max_nodes, float *pos, int *parent) {
+  const double sx = p[0], sy = p[1], sz = p[2], gz = p[3], h = p[4] > 1e-4f ? p[4] : 1e-4f;
+  const float eta = p[5], fw = fminf(fmaxf(p[6], 0.f), 1.f);
+  const uint32_t seed = (uint32_t)p[7];
+  const int has_t = p[8] > 0.5f;
+  const double tx = (p[9] - sx) / h, ty = (p[10] - sy) / h, tz = (p[11] - sz) / h, tdist = sqrt(tx * tx + ty * ty + tz * tz);
+  const int kg = (int)floor((gz - sz) / h + 0.5); /* ground level on the lattice */
+  const double strike = 3.0; /* striking distance, in steps */
+  if (max_nodes < 2 || (!has_t && kg >= 0) || (has_t && tdist < strike)) return 0;
+  ftz(); /* phi^eta of weak candidates underflows: keep it out of denormal math */
+  int cap = 26 * max_nodes + 27;
+  int *ni = malloc(sizeof(int) * 3 * (size_t)max_nodes);
+  int *ci = malloc(sizeof(int) * 3 * (size_t)cap), *cpar = malloc(sizeof(int) * (size_t)cap);
+  double *cphi = malloc(sizeof(double) * (size_t)cap);
+  float *cfield = malloc(sizeof(float) * (size_t)cap), *wt = malloc(sizeof(float) * (size_t)cap);
+  size_t tsize = 1;
+  while (tsize < (size_t)(max_nodes + cap) * 2) tsize <<= 1;
+  LnSet set = {calloc(tsize, sizeof(uint64_t)), tsize - 1};
+  int n = 0, nc = 0, done = 0;
+#define LN_ADD_NODE(I, J, K, PAR)                                                   \
+  do {                                                                              \
+    ni[3 * n] = (I); ni[3 * n + 1] = (J); ni[3 * n + 2] = (K); parent[n] = (PAR);   \
+    pos[3 * n] = (float)(sx + h * (I)); pos[3 * n + 1] = (float)(sy + h * (J));     \
+    pos[3 * n + 2] = (float)(sz + h * (K));                                         \
+    n++;                                                                            \
+  } while (0)
+  ln_insert(&set, ln_key(0, 0, 0));
+  LN_ADD_NODE(0, 0, 0, -1);
+  int last = 0;
+  for (;;) {
+    /* candidates around the newest node: potential from every node so far, field toward the goal */
+    const int *q = ni + 3 * last;
+    for (int d = 0; d < 27; d++) {
+      int i = q[0] + d % 3 - 1, j = q[1] + d / 3 % 3 - 1, k = q[2] + d / 9 - 1;
+      if (d == 13 || k > 1 || k < kg) continue; /* no climbing above the cloud base or under the ground */
+      if (!ln_insert(&set, ln_key(i, j, k))) continue;
+      double s = 0;
+      for (int m = 0; m < n; m++) {
+        double dx = i - ni[3 * m], dy = j - ni[3 * m + 1], dz = k - ni[3 * m + 2];
+        s += 1.0 - LN_R1 / sqrt(dx * dx + dy * dy + dz * dz);
+      }
+      /* field: how far toward the goal. With no target it aims at the ground point under the start, so the
+       * bolt leans and wanders but stays roughly below its cloud end; it still strikes wherever it lands. */
+      double ex = has_t ? i - tx : i, ey = has_t ? j - ty : j, ez = has_t ? k - tz : k - kg;
+      double f = 1.0 - sqrt(ex * ex + ey * ey + ez * ez) / (has_t ? tdist : -kg);
+      ci[3 * nc] = i; ci[3 * nc + 1] = j; ci[3 * nc + 2] = k;
+      cpar[nc] = last; cphi[nc] = s; cfield[nc] = (float)(f < 0 ? 0 : (f > 1 ? 1 : f));
+      nc++;
+    }
+    if (done || n >= max_nodes || !nc) break;
+    /* phi = blend of normalized charge potential and field; pick with probability phi^eta */
+    double lo = INFINITY, hi = -INFINITY;
+#pragma omp parallel for reduction(min : lo) reduction(max : hi) schedule(static)
+    for (int c = 0; c < nc; c++) {
+      lo = fmin(lo, cphi[c]);
+      hi = fmax(hi, cphi[c]);
+    }
+    double inv = hi > lo ? 1.0 / (hi - lo) : 0.0;
+    const int B = 1024, nb = (nc + B - 1) / B;
+    double bsum[4096], *bs = nb <= 4096 ? bsum : malloc(sizeof(double) * (size_t)nb);
+#pragma omp parallel for schedule(static)
+    for (int b = 0; b < nb; b++) {
+      double acc = 0;
+      int c1 = (b + 1) * B < nc ? (b + 1) * B : nc;
+      for (int c = b * B; c < c1; c++) {
+        float ph = (float)((1.0 - fw) * (cphi[c] - lo) * inv) + fw * cfield[c];
+        float w = ph > 1e-3f ? expf(eta * logf(ph)) : 0.f;
+        wt[c] = w;
+        acc += w;
+      }
+      bs[b] = acc;
+    }
+    double tot = 0;
+    for (int b = 0; b < nb; b++) tot += bs[b];
+    double u = (double)u01(h3(seed, (uint32_t)n, 0x6c69u)) * tot;
+    int pick = nc - 1;
+    for (int b = 0; b < nb; b++) {
+      if (u < bs[b] || b == nb - 1) {
+        int c1 = (b + 1) * B < nc ? (b + 1) * B : nc;
+        pick = c1 - 1;
+        for (int c = b * B; c < c1; c++) {
+          if (u < wt[c]) { pick = c; break; }
+          u -= wt[c];
+        }
+        break;
+      }
+      u -= bs[b];
+    }
+    if (bs != bsum) free(bs);
+    /* the candidate joins the channel */
+    int I = ci[3 * pick], J = ci[3 * pick + 1], K = ci[3 * pick + 2], par = cpar[pick];
+    nc--;
+    ci[3 * pick] = ci[3 * nc]; ci[3 * pick + 1] = ci[3 * nc + 1]; ci[3 * pick + 2] = ci[3 * nc + 2];
+    cpar[pick] = cpar[nc]; cphi[pick] = cphi[nc]; cfield[pick] = cfield[nc];
+    LN_ADD_NODE(I, J, K, par);
+    last = n - 1;
+#pragma omp parallel for schedule(static)
+    for (int c = 0; c < nc; c++) {
+      double dx = ci[3 * c] - I, dy = ci[3 * c + 1] - J, dz = ci[3 * c + 2] - K;
+      cphi[c] += 1.0 - LN_R1 / sqrt(dx * dx + dy * dy + dz * dz);
+    }
+    /* within striking distance of the goal: one last node exactly on it */
+    if (has_t) {
+      double ex = I - tx, ey = J - ty, ez = K - tz;
+      if (ex * ex + ey * ey + ez * ez <= strike * strike && n < max_nodes) {
+        parent[n] = last;
+        pos[3 * n] = p[9]; pos[3 * n + 1] = p[10]; pos[3 * n + 2] = p[11];
+        n++;
+        done = 1;
+      }
+    } else if (K <= kg + strike && n < max_nodes) {
+      parent[n] = last;
+      pos[3 * n] = pos[3 * last]; pos[3 * n + 1] = pos[3 * last + 1]; pos[3 * n + 2] = (float)gz;
+      n++;
+      done = 1;
+    }
+    if (done) break;
+  }
+#undef LN_ADD_NODE
+  free(ni); free(ci); free(cpar); free(cphi); free(cfield); free(wt); free(set.key);
+  return done ? n : -n;
+}

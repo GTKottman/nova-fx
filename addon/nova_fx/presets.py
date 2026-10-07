@@ -6,7 +6,7 @@ import bmesh
 import bpy
 from mathutils import Euler, Matrix, Vector
 
-from . import render, sim
+from . import lightning, render, sim
 from .params import chem
 
 # ------------------------------------------------------------------ building blocks
@@ -496,6 +496,20 @@ def build_snow(context, coll):
     return s
 
 
+def build_lightning(context, coll):
+    """A cloud-to-ground strike from 50 m (inside the stage's cloud deck), with molten spatter where it lands."""
+    s = new_system(context, coll, "Lightning Impact", [
+        bb("Spark", 3200, (0.3, 0.9), (0.05, 0.015), 80, drag_quad=0.3, cool=2.5, cool_rad=0.8,
+           collide="BOUNCE", bounce=0.3, friction=0.4, split_kind="Spark", split_rate=0.8, split_count=2,
+           split_speed=1.5, split_max_gen=1),
+    ], display="STREAKS", streak_length=0.03, substeps=2)
+    ground(coll, 300)
+    em = emitter(coll, s, "Lightning Impact Point", "Spark", (0, 0, 0.05), display="SPHERE", size=0.3,
+                 shape="POINT", direction="OBJECT_Z", spread=1.3, rate=0, burst=150, speed=11, speed_var=0.5)
+    lightning.add(context, coll, (0, 0, 50), strike_frame=24, impact=em)
+    return s
+
+
 def build_empty(context, coll):
     s = new_system(context, coll, "Nova System", [
         dict(name="Particle", color_mode="BLACKBODY", temp0=2400, life_min=1, life_max=2, emit=20),
@@ -517,6 +531,8 @@ PRESETS = [
     ("EMBERS", "Drifting Embers", "Ambient embers carried by wind and heat", build_embers),
     ("VORTEX", "Energy Vortex", "Particles swirling around a vortex force", build_vortex),
     ("SNOW", "Snow", "Lit snowfall that settles", build_snow),
+    ("LIGHTNING", "Lightning", "Branching cloud-to-ground strike: stepped leader, return strokes, afterglow",
+     build_lightning),
     ("EMPTY", "Empty System", "One type, one emitter: start from scratch", build_empty),
 ]
 
@@ -546,13 +562,57 @@ STAGES = {
     "EMBERS": ((0, -8, 2.0), (0, 0, 2.0), 35, True),
     "VORTEX": ((0, -8.5, 5.5), (0, 0, 0), 35, True),
     "SNOW": ((0, -14, 2.5), (0, 0, 2.5), 35, "DUSK"),
+    "LIGHTNING": ((0, -95, 7), (0, 0, 23), 30, True),
     "EMPTY": ((0, -10, 3), (0, 0, 2), 35, False),
 }
+
+
+def cloud_deck(coll, z0, z1, size=400.0, density=0.06, name="Nova Cloud Deck"):
+    """A slab of procedural storm cloud (volume), for flashes to light from inside."""
+    ob = _mesh(coll, name, lambda bm: bmesh.ops.create_cube(bm, size=1.0), (0, 0, 0.5 * (z0 + z1)))
+    ob.scale = (size, size, z1 - z0)
+    mat = bpy.data.materials.get(name) or bpy.data.materials.new(name)
+    mat.use_nodes = True
+    nt = mat.node_tree
+    nt.nodes.clear()
+    tc = nt.nodes.new("ShaderNodeTexCoord")
+    noise = nt.nodes.new("ShaderNodeTexNoise")
+    noise.inputs["Scale"].default_value = 0.035  # world metres: billows ~30 m across
+    noise.inputs["Detail"].default_value = 6.0
+    ramp = nt.nodes.new("ShaderNodeValToRGB")
+    ramp.color_ramp.elements[0].position, ramp.color_ramp.elements[1].position = 0.42, 0.68
+    # thin out toward the bottom of the slab so the base reads as a ragged cloud base
+    sep = nt.nodes.new("ShaderNodeSeparateXYZ")
+    base = nt.nodes.new("ShaderNodeMapRange")
+    base.inputs["From Min"].default_value, base.inputs["From Max"].default_value = -0.5, -0.1
+    mul = nt.nodes.new("ShaderNodeMath")
+    mul.operation = "MULTIPLY"
+    dens = nt.nodes.new("ShaderNodeMath")
+    dens.operation = "MULTIPLY"
+    dens.inputs[1].default_value = density
+    vol = nt.nodes.new("ShaderNodeVolumePrincipled")
+    vol.inputs["Color"].default_value = (0.55, 0.58, 0.65, 1)
+    out = nt.nodes.new("ShaderNodeOutputMaterial")
+    L = nt.links.new
+    geo = nt.nodes.new("ShaderNodeNewGeometry")
+    L(geo.outputs["Position"], noise.inputs["Vector"])
+    L(noise.outputs["Fac"], ramp.inputs["Fac"])
+    L(tc.outputs["Object"], sep.inputs[0])
+    L(sep.outputs["Z"], base.inputs["Value"])
+    L(ramp.outputs["Color"], mul.inputs[0])
+    L(base.outputs[0], mul.inputs[1])
+    L(mul.outputs[0], dens.inputs[0])
+    L(dens.outputs[0], vol.inputs["Density"])
+    L(vol.outputs[0], out.inputs["Volume"])
+    ob.data.materials.append(mat)
+    return ob
 
 
 def setup_stage(context, coll, key, offset):
     loc, target, lens, night = STAGES[key]
     camera(context, coll, Vector(loc) + offset, Vector(target) + offset, lens)
+    if key == "LIGHTNING":
+        cloud_deck(coll, 42, 60).location += offset
     if night == "DUSK":
         night_world(context, (0.06, 0.07, 0.1))
     elif night:

@@ -41,8 +41,10 @@ class NOVA_OT_add_preset(bpy.types.Operator):
         sysob = presets.build(context, self.preset, self.setup_scene)
         for ob in context.selected_objects:
             ob.select_set(False)
-        sysob.select_set(True)
-        context.view_layer.objects.active = sysob
+        # a bolt carries the effect's settings, so it gets the focus over its spark system
+        focus = next((o for c in sysob.users_collection for o in c.objects if o.nova_lightning.enabled), sysob)
+        focus.select_set(True)
+        context.view_layer.objects.active = focus
         context.scene.frame_set(sysob.nova.frame_start)
         self.report({"INFO"}, f"{sysob.name}: press Play to preview, or Bake")
         return {"FINISHED"}
