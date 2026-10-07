@@ -6,6 +6,8 @@
 //                                   f1 = (time*speed, dx, ox, oy), f2.x = oz
 //  3 add cell forces to faces       o0 = (U, V, W, -), o1.x = tmp, f0.x = dt
 //  4 wind relaxation + damping      o0 = (U, V, W, -), f0 = (a, e, -, -), f1 = (wind x, y, z, -)
+// Tiled: op 0 advection tiles (w face_box), 1 and 2 pressure tiles (cells; op 2 pushes only in advection
+// tiles), 3 advection tiles (cells), 4 pressure tiles (faces_union).
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
 #include "common.glsl"
 
@@ -65,9 +67,9 @@ vec3 cvel(int i, int j, int k) {
               0.5 * (F[pc.o0.z + widx(i, j, k)] + F[pc.o0.z + widx(i, j, k + 1)]));
 }
 
-void main() {
+// act: the cell is in the advection region; mu/mv/mw: op 4 updates this index's u/v/w face
+void at(ivec3 g, bool act, bool mu, bool mv, bool mw) {
   int op = pc.n.w;
-  ivec3 g = ivec3(gl_GlobalInvocationID);
   int nx = pc.n.x, ny = pc.n.y, nz = pc.n.z;
   uint nc = uint(nx * ny * nz);
   if (op == 0) {
@@ -92,7 +94,7 @@ void main() {
     uint c = cidx(g.x, g.y, g.z), T = pc.o1.x;
     vec3 fo = vec3(0.0);
     float eps_dx = pc.f0.x, inv2 = pc.f0.y;
-    if (eps_dx > 0.0 && !(g.x == 0 || g.y == 0 || g.z == 0 || g.x == nx - 1 || g.y == ny - 1 || g.z == nz - 1)) {
+    if (act && eps_dx > 0.0 && !(g.x == 0 || g.y == 0 || g.z == 0 || g.x == nx - 1 || g.y == ny - 1 || g.z == nz - 1)) {
       uint wm = T + 3u * nc, sy = uint(nx), sz = uint(nx * ny);
       vec3 gr = vec3(F[wm + c + 1u] - F[wm + c - 1u], F[wm + c + sy] - F[wm + c - sy], F[wm + c + sz] - F[wm + c - sz]) * inv2;
       gr /= length(gr) + 1e-6;
@@ -100,7 +102,7 @@ void main() {
       fo = eps_dx * cross(gr, w);
     }
     float tamp = pc.f0.z;
-    if (tamp > 0.0) {
+    if (act && tamp > 0.0) {
       float wgt = min(1.0, F[pc.o0.w + c] + F[pc.o1.y + c]);
       if (wgt > 1e-3) {
         vec3 X = vec3(pc.f1.z, pc.f1.w, pc.f2.x) + (vec3(g) + 0.5) * pc.f1.y;
@@ -119,8 +121,28 @@ void main() {
     if (g.z > 0) F[pc.o0.z + widx(g.x, g.y, g.z)] += h * (F[T + 6u * nc + c] + F[T + 6u * nc + c - sz]);
   } else if (op == 4) {
     float a = pc.f0.x, e = pc.f0.y;
-    if (g.x <= nx && g.y < ny && g.z < nz) { uint c = pc.o0.x + uidx(g.x, g.y, g.z); F[c] = (F[c] + (pc.f1.x - F[c]) * a) * e; }
-    if (g.x < nx && g.y <= ny && g.z < nz) { uint c = pc.o0.y + vidx(g.x, g.y, g.z); F[c] = (F[c] + (pc.f1.y - F[c]) * a) * e; }
-    if (g.x < nx && g.y < ny && g.z <= nz) { uint c = pc.o0.z + widx(g.x, g.y, g.z); F[c] = (F[c] + (pc.f1.z - F[c]) * a) * e; }
+    if (mu) { uint c = pc.o0.x + uidx(g.x, g.y, g.z); F[c] = (F[c] + (pc.f1.x - F[c]) * a) * e; }
+    if (mv) { uint c = pc.o0.y + vidx(g.x, g.y, g.z); F[c] = (F[c] + (pc.f1.y - F[c]) * a) * e; }
+    if (mw) { uint c = pc.o0.z + widx(g.x, g.y, g.z); F[c] = (F[c] + (pc.f1.z - F[c]) * a) * e; }
   }
+}
+void main() {
+  int op = pc.n.w;
+  ivec3 n = pc.n.xyz;
+  if (!tiled()) {
+    ivec3 g = ivec3(gl_GlobalInvocationID);
+    at(g, true, g.x <= n.x && g.y < n.y && g.z < n.z, g.x < n.x && g.y <= n.y && g.z < n.z,
+       g.x < n.x && g.y < n.y && g.z <= n.z);
+    return;
+  }
+  int t = cur_tile();
+  if (op == 4) {
+    Box bu, bv, bw;
+    Box b = faces_union(t, n, false, bu, bv, bw);
+    BOX_BEGIN(b) at(g, true, in_box(g, bu), in_box(g, bv), in_box(g, bw)); BOX_END
+    return;
+  }
+  bool act = (tile_flags(t) & TILE_ADV) != 0u;
+  Box b = op == 0 ? face_box(t, n, 2, false) : tile_box(t, n);
+  BOX_BEGIN(b) at(g, act, false, false, false); BOX_END
 }

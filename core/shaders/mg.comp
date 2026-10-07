@@ -7,7 +7,13 @@
 //  2 r = b - A x                o0 = (x, b, r, stencil)
 //  3 restrict to coarse b       o0 = (fine r, fine stencil, coarse b, coarse stencil), o1 = (fine nx, ny, nz, -)
 //  4 prolong: x += coarse x     o0 = (x, -, -, stencil), o1 = (coarse x, cnx, cny, -)
+//  6 write changed stencil blocks: per workgroup PIDX[o1.x + 513 w] = block, then its 512 words in
+//    block order; o0.w = stencil, o1.y = 1: level 0, whose words also carry the solid flag (o2.x = solid)
+//  7 the whole coarsest-level solve in this one workgroup (n.x * n.y * n.z <= 256): x = 0, then 12 red-black
+//    sweeps and 12 black-red, as the dispatch path. o0 = (x, b, -, stencil). x lives in shared memory, so
+//    the sweeps are ordered by workgroup barriers alone.
 // stencil word: diag | fluid-neighbour bits << 8
+// Tiled: the level's active 8^3 blocks (op 3 and 5: the coarse level's), cells.
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
 #include "common.glsl"
 float Ax(uint X, uint st, uint c, int nx, int ny) {
@@ -24,9 +30,8 @@ float Ax(uint X, uint st, uint c, int nx, int ny) {
   if ((m & 32u) != 0u) s -= F[X + c + sz];
   return s;
 }
-void main() {
+void cell(ivec3 g) {
   int op = pc.n.w;
-  ivec3 g = ivec3(gl_GlobalInvocationID);
   if (any(greaterThanEqual(g, pc.n.xyz))) return;
   int nx = pc.n.x, ny = pc.n.y;
   uint c = uint(g.x + nx * (g.y + ny * g.z));
@@ -78,4 +83,52 @@ void main() {
     int cx = int(pc.o1.y), cy = int(pc.o1.z);
     F[pc.o0.x + c] += F[pc.o1.x + uint((g.x >> 1) + cx * ((g.y >> 1) + cy * (g.z >> 1)))];
   }
+}
+shared float xs[256];
+void coarsest() {
+  int nx = pc.n.x, ny = pc.n.y, nz = pc.n.z, n = nx * ny * nz, c = int(gl_LocalInvocationIndex);
+  bool own = c < n;
+  int i = c % nx, j = (c / nx) % ny, k = c / (nx * ny);
+  uint w = own ? S[pc.o0.w + uint(c)] : 0u, dg = w & 255u, m = w >> 8;
+  float b = own ? F[pc.o0.y + uint(c)] : 0.0;
+  xs[c] = 0.0;
+  barrier();
+  for (int s = 0; s < 48; s++) {
+    // sweeps 0-23: colours 0, 1, 0, 1, ...; sweeps 24-47: 1, 0, 1, 0, ...
+    int color = (s < 24 ? s : s + 1) & 1;
+    float v = 0.0;
+    bool upd = own && dg != 0u && ((i + j + k + color) & 1) == 0;
+    if (upd) {
+      v = b;
+      if ((m & 1u) != 0u) v += xs[c - 1];
+      if ((m & 2u) != 0u) v += xs[c + 1];
+      if ((m & 4u) != 0u) v += xs[c - nx];
+      if ((m & 8u) != 0u) v += xs[c + nx];
+      if ((m & 16u) != 0u) v += xs[c - nx * ny];
+      if ((m & 32u) != 0u) v += xs[c + nx * ny];
+      v /= float(dg);
+    }
+    barrier();
+    if (upd) xs[c] = v;
+    barrier();
+  }
+  if (own) F[pc.o0.x + uint(c)] = xs[c];
+}
+void main() {
+  if (pc.n.w == 7) { coarsest(); return; }
+  if (pc.n.w == 6) {
+    uint base = pc.o1.x + 513u * gl_WorkGroupID.x;
+    Box b = tile_box(int(PIDX[base]), pc.n.xyz);
+    for (uint li = gl_LocalInvocationIndex; li < 512u; li += 256u) {
+      ivec3 g = b.lo + ivec3(int(li & 7u), int((li >> 3) & 7u), int(li >> 6));
+      if (any(greaterThanEqual(g, b.hi))) continue;
+      uint w = PIDX[base + 1u + li], c = cidx(g.x, g.y, g.z);
+      S[pc.o0.w + c] = w & 0xFFFFu;
+      if (pc.o1.y != 0u) S[pc.o2.x + c] = w >> 16;
+    }
+    return;
+  }
+  if (!tiled()) { cell(ivec3(gl_GlobalInvocationID)); return; }
+  Box b = tile_box(cur_tile(), pc.n.xyz);
+  BOX_BEGIN(b) cell(g); BOX_END
 }

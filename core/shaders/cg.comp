@@ -6,7 +6,7 @@
 //  3 p = z + b p                      o0 = (p, z, -, -), b = R[o1.y] / R[o1.z] (rz_new / rz_old)
 //  4 r = b - A x (inactive: x=r=0), partial max|r|, partial max|b|   o0 = (x, b, r, stencil), n.y,n.z dims
 //  5 reduce R[o1.x .. +o1.y) -> R[o1.z] (sum if o1.w == 0 else max), single workgroup
-//  6 x = 0 where inactive, partial max|b|   o0 = (x, b, -, stencil)
+// Tiled: the pressure tiles, one partial per tile.
 layout(local_size_x = 256) in;
 #include "common.glsl"
 shared float red[256];
@@ -25,11 +25,40 @@ float Ax(uint X, uint st, uint c, int nx, int ny) {
   if ((m & 32u) != 0u) s -= F[X + c + sz];
   return s;
 }
+// one cell: v (summed or maxed per op) and v2 (op 4: |b|)
+void cell(int op, uint c, out float v, out float v2) {
+  v = 0.0; v2 = 0.0;
+  if (op == 0) {
+    float q = Ax(pc.o0.x, pc.o0.w, c, pc.n.y, pc.n.z);
+    F[pc.o0.y + c] = q;
+    v = F[pc.o0.x + c] * q;
+  } else if (op == 1) {
+    float den = R[pc.o1.z];
+    float a = den != 0.0 ? R[pc.o1.y] / den : 0.0;
+    F[pc.o0.x + c] += a * F[pc.o0.y + c];
+    float r = F[pc.o0.z + c] - a * F[pc.o0.w + c];
+    F[pc.o0.z + c] = r;
+    v = abs(r);
+  } else if (op == 2) {
+    v = F[pc.o0.x + c] * F[pc.o0.y + c];
+  } else if (op == 3) {
+    float den = R[pc.o1.z];
+    float b = den != 0.0 ? R[pc.o1.y] / den : 0.0;
+    F[pc.o0.x + c] = F[pc.o0.y + c] + b * F[pc.o0.x + c];
+  } else if (op == 4) {
+    bool act = (S[pc.o0.w + c] & 255u) != 0u;
+    if (!act) F[pc.o0.x + c] = 0.0;
+    float r = act ? F[pc.o0.y + c] - Ax(pc.o0.x, pc.o0.w, c, pc.n.y, pc.n.z) : 0.0;
+    F[pc.o0.z + c] = r;
+    v = abs(r);
+    v2 = abs(F[pc.o0.y + c]);
+  }
+}
 void main() {
   int op = pc.n.w;
   uint l = gl_LocalInvocationIndex;
   if (op == 5) {
-    float acc = pc.o1.w == 0u ? 0.0 : 0.0;
+    float acc = 0.0;
     for (uint i = l; i < pc.o1.y; i += 256u) {
       float v = R[pc.o1.x + i];
       acc = pc.o1.w == 0u ? acc + v : max(acc, v);
@@ -43,40 +72,24 @@ void main() {
     if (l == 0u) R[pc.o1.z] = red[0];
     return;
   }
-  uint c = gl_GlobalInvocationID.x, n = uint(pc.n.x);
+  bool is_max = op == 1 || op == 4;
   float v = 0.0, v2 = 0.0;
-  if (c < n) {
-    if (op == 0) {
-      float q = Ax(pc.o0.x, pc.o0.w, c, pc.n.y, pc.n.z);
-      F[pc.o0.y + c] = q;
-      v = F[pc.o0.x + c] * q;
-    } else if (op == 1) {
-      float den = R[pc.o1.z];
-      float a = den != 0.0 ? R[pc.o1.y] / den : 0.0;
-      F[pc.o0.x + c] += a * F[pc.o0.y + c];
-      float r = F[pc.o0.z + c] - a * F[pc.o0.w + c];
-      F[pc.o0.z + c] = r;
-      v = abs(r);
-    } else if (op == 2) {
-      v = F[pc.o0.x + c] * F[pc.o0.y + c];
-    } else if (op == 3) {
-      float den = R[pc.o1.z];
-      float b = den != 0.0 ? R[pc.o1.y] / den : 0.0;
-      F[pc.o0.x + c] = F[pc.o0.y + c] + b * F[pc.o0.x + c];
-    } else if (op == 4) {
-      bool act = (S[pc.o0.w + c] & 255u) != 0u;
-      if (!act) F[pc.o0.x + c] = 0.0;
-      float r = act ? F[pc.o0.y + c] - Ax(pc.o0.x, pc.o0.w, c, pc.n.y, pc.n.z) : 0.0;
-      F[pc.o0.z + c] = r;
-      v = abs(r);
-      v2 = abs(F[pc.o0.y + c]);
-    }
+  if (!tiled()) {
+    if (gl_GlobalInvocationID.x < uint(pc.n.x)) cell(op, gl_GlobalInvocationID.x, v, v2);
+  } else {  // the pressure tiles; n.x = cell count, n.y = nx, n.z = ny
+    ivec3 dims = ivec3(pc.n.y, pc.n.z, pc.n.x / (pc.n.y * pc.n.z));
+    Box b = tile_box(cur_tile(), dims);
+    CELLS1D_BEGIN(b)
+      float a, a2;
+      cell(op, uint(g.x + dims.x * (g.y + dims.y * g.z)), a, a2);
+      v = is_max ? max(v, a) : v + a;
+      v2 = max(v2, a2);
+    CELLS1D_END
   }
   if (op == 3) return;
   red[l] = v;
   red2[l] = v2;
   barrier();
-  bool is_max = op == 1 || op == 4;
   for (uint s = 128u; s > 0u; s >>= 1) {
     if (l < s) {
       red[l] = is_max ? max(red[l], red[l + s]) : red[l] + red[l + s];

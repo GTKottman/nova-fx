@@ -87,10 +87,11 @@ class NOVA_PT_system(_Panel, bpy.types.Panel):
                 c.label(text=st["device"], icon="CHECKMARK" if st["device"].startswith("GPU:") else "ERROR")
             if st.get("cells"):
                 c.label(text=f"Fluid {st['fluid_ms']:.0f} ms · {st['cg_iters']} pressure iterations")
-                if str(st.get("device", "")).startswith("GPU:"):
-                    c.label(text=f"{st['cells'] / 1e6:.2f}M cells on the GPU (dense)")
+                where = "on the GPU" if str(st.get("device", "")).startswith("GPU:") else "on the CPU"
+                if n.fluid.sparse:
+                    c.label(text=f"{st['active'] * 100:.0f}% of {st['cells'] / 1e6:.2f}M cells active {where} (sparse)")
                 else:
-                    c.label(text=f"{st['active'] * 100:.0f}% of {st['cells'] / 1e6:.2f}M cells active (sparse)")
+                    c.label(text=f"{st['cells'] / 1e6:.2f}M cells {where} (dense)")
 
 
 class NOVA_PT_types(_Panel, bpy.types.Panel):

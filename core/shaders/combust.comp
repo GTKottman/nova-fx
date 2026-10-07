@@ -3,10 +3,10 @@
 // o0 = (density, heat, fuel, flame), o1.x = expn
 // f0 = (ignite, burn_rate, heat_release, smoke_yield), f1 = (expansion, exp(-cool dt), cool_rad, exp(-smoke_decay dt))
 // f2 = (exp(-fuel_decay dt), exp(-flame_decay dt), dt, 0)
+// Tiled: the advection tiles, cells.
 layout(local_size_x = 256) in;
 #include "common.glsl"
-void main() {
-  uint c = gl_GlobalInvocationID.x;
+void cell(uint c) {
   if (c >= uint(pc.n.x * pc.n.y * pc.n.z)) return;
   float fu = F[pc.o0.z + c], T = F[pc.o0.y + c], d = F[pc.o0.x + c];
   float ign = pc.f0.x, br = pc.f0.y, hr = pc.f0.z, sy = pc.f0.w, ex = pc.f1.x, ec = pc.f1.y, cr = pc.f1.z;
@@ -28,4 +28,9 @@ void main() {
   F[pc.o0.y + c] = T;
   F[pc.o0.x + c] = d * pc.f1.w;
   F[pc.o0.z + c] = fu * pc.f2.x;
+}
+void main() {
+  if (!tiled()) { cell(gl_GlobalInvocationID.x); return; }
+  Box b = tile_box(cur_tile(), pc.n.xyz);
+  CELLS1D_BEGIN(b) cell(cidx(g.x, g.y, g.z)); CELLS1D_END
 }

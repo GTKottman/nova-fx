@@ -1,10 +1,12 @@
 #version 450
 // Per 8^3 tile: does it hold smoke/heat/fuel/flame? R[o2.x + tile] = max over the tile.
+// Tiled: the listed tiles, R[o2.x + list position].
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
 #include "common.glsl"
 shared float red[512];
 void main() {
   ivec3 g = ivec3(gl_GlobalInvocationID);
+  if (tiled()) g = tile_box(cur_tile(), pc.n.xyz).lo + ivec3(gl_LocalInvocationID);
   uint l = gl_LocalInvocationIndex;
   uint nc = uint(pc.n.x * pc.n.y * pc.n.z);
   float m = 0.0;
@@ -20,6 +22,6 @@ void main() {
   }
   if (l == 0u) {
     uvec3 w = gl_WorkGroupID, ng = gl_NumWorkGroups;
-    R[pc.o2.x + w.x + ng.x * (w.y + ng.y * w.z)] = red[0];
+    R[pc.o2.x + (tiled() ? w.x : w.x + ng.x * (w.y + ng.y * w.z))] = red[0];
   }
 }

@@ -198,16 +198,32 @@ Press Play to watch it live, or *Bake* to cache it to disk. The same settings ap
 ### GPU fluid (Vulkan)
 - **Setting:** `Fire & Smoke → Device: GPU` runs the whole fluid substep in Vulkan compute (`core/gpu_vk.c`,
   `core/shaders/*.comp`) with the state resident in VRAM.
-- **Same solver:** it mirrors the CPU one kernel for kernel, and the tests check that: identical after one frame,
-  and after eight frames no cell off by more than 0.5% of peak. Repeated runs give bit-identical results.
+- **Same solver:** it mirrors the CPU one kernel for kernel, and the tests check that, dense and sparse: identical
+  after one frame, and after 8–16 frames no cell off by more than 0.5% of peak. Repeated runs give bit-identical results.
+- **Sparse like the CPU:** every kernel runs one workgroup per active 8³ tile (the multigrid levels per active
+  block), so the work follows the effect, not the domain. The CPU still does the tile bookkeeping: the GPU
+  reports which candidate tiles hold anything (one small readback), and gets back the tile lists and only the
+  stencil blocks that changed. Tiles that leave the region are cleared on the GPU, as on the CPU.
 - **Pressure solve:** MGPCG with the CG scalars kept on the GPU. The host syncs once per batch of 6 iterations.
-- **Sources and deposits:** bucketed by tile on the CPU and gathered per cell on the GPU. No atomics, so results
-  are deterministic.
-- **Transfers:** the CPU keeps the bookkeeping (solids, multigrid stencils, which are uploaded only when they
-  change). Fields come back only for VDB export, and velocity only for particles that ride the flow.
+  The coarsest multigrid level (≤ 64 cells) is solved in one workgroup in shared memory: 1 dispatch instead of 49.
+- **Sources and deposits:** bucketed by tile on the CPU and gathered per cell on the GPU, only in the tiles the
+  points reach. No atomics, so results are deterministic.
+- **Transfers:** fields come back only for VDB export, and velocity only for particles that ride the flow.
 - **Build:** `libvulkan` is loaded at runtime. Shaders are compiled with `glslc` and committed as SPIR-V
   (`core/shaders_spv.h`), so building never needs a shader compiler. Without Vulkan, the add-on falls back to CPU.
-- **Limitation:** the GPU solver is dense. For a small fire in a huge domain, the sparse CPU solver can still be faster.
+- **Limitations:** VRAM is still allocated for the whole domain, and the VDB export and particle coupling download
+  whole fields. Small effects bottom out at ~7–9 ms/frame: the pressure solve is ~800 small dispatches per
+  substep, so at that size it is bound by dispatch latency, not by cells.
+
+Wall time per frame, small plume in a growing empty domain (`bench/fluid_devices.py`, RTX 3080, 16 threads):
+
+| Cells | Active | CPU sparse | GPU dense | GPU sparse |
+|---|---|---|---|---|
+| 0.4M | 55% | 25.7 ms | 7.2 ms | 7.5 ms |
+| 3.1M | 7% | 26.8 ms | 40.8 ms | 9.2 ms |
+| 10.6M | 2% | 34.4 ms | 113.7 ms | 9.2 ms |
+
+A wide fire that fills ~40% of a 6.1M-cell domain: CPU sparse 862 ms, GPU dense 165 ms, GPU sparse 61 ms.
 
 ### Blender side
 - Native **PointCloud** objects with these attributes: `position`, `radius`, `Cd`, `emit`, `velocity`
@@ -258,4 +274,4 @@ From the paid tools (X-Particles, tyFlow, EmberGen, Pro Pyro, VFX Pro Simulation
 - A domain that follows the effect around (sparse tiles cover most of that benefit)
 - Tile-ordered grid storage (memory proportional to the effect; pages are currently row-shaped)
 - SIMD (8-wide) turbulence noise
-- Sparse GPU dispatch (active tiles only) and GPU particles
+- GPU particles, and sparse VRAM (tile-ordered storage on the GPU)
