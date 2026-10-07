@@ -205,6 +205,35 @@ def test_gpu_sparse_matches_cpu():
     assert np.array_equal(b, c) and np.array_equal(bv, cv)  # run to run: bit-identical
 
 
+def test_lightning():
+    """Dielectric-breakdown bolt: deterministic per seed, reaches the ground (or the target) in every seed,
+    branches, and grows in milliseconds."""
+    import ctypes as C
+    L = core.lib()
+    def grow(seed, target=None, h=45 / 130, eta=12.0, field=0.3):
+        t = target or (0, 0, 0)
+        p = np.array([0, 0, 45, 0, h, eta, field, seed, 1 if target else 0, *t], np.float32)
+        pos = np.zeros(3 * 20000, np.float32); par = np.zeros(20000, np.int32)
+        t0 = time.perf_counter()
+        n = L.nv_lightning(core.fptr(p), 20000, core.fptr(pos), par.ctypes.data_as(C.POINTER(C.c_int)))
+        return pos[:3 * abs(n)].reshape(-1, 3), par[:abs(n)], n > 0, time.perf_counter() - t0
+    grow(0)  # warm up the thread pool
+    a, pa, ok, _ = grow(7); b, pb, _, _ = grow(7); c, _, _, _ = grow(8)
+    assert ok and np.array_equal(a, b) and np.array_equal(pa, pb) and not np.array_equal(a[:len(c)], c[:len(a)])
+    hits, ms, kids = 0, [], []
+    for seed in range(1, 11):
+        P, par, ok, dt = grow(seed)
+        hits += ok; ms.append(dt * 1000)
+        assert P[-1, 2] == 0 and (par[1:] < np.arange(1, len(par))).all()  # ends on the ground; parents first
+        kids.append(np.bincount(par[1:], minlength=len(par)).max())
+    assert hits == 10 and min(kids) >= 2, (hits, kids)  # every seed strikes, every bolt forks
+    P, par, ok, _ = grow(3, target=(12, -5, 8))
+    assert ok and np.allclose(P[-1], (12, -5, 8))  # a strike target is hit exactly
+    print(f"lightning: 10/10 seeds strike, {int(np.median([len(grow(s)[0]) for s in range(1, 11)]))} steps, "
+          f"median {np.median(ms):.0f} ms, max {max(ms):.0f} ms; target hit")
+    assert np.median(ms) < 200
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and (len(sys.argv) < 2 or name in sys.argv[1:]):

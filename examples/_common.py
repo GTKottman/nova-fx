@@ -45,6 +45,8 @@ def add(preset, cache_name):
     """Add a preset with camera, night sky and glow; cache into a temp folder."""
     bpy.ops.nova.add_preset(preset=preset, setup_scene=True)
     so = bpy.context.object
+    if not so.nova.is_system:  # Lightning focuses its bolt; the cache belongs to the preset's particle system
+        so = next(o for c in so.users_collection for o in c.objects if o.nova.is_system)
     so.nova.cache_dir = os.path.join(WORK, "cache", cache_name) + "/"
     nova("sim").free_cache(so)
     bpy.context.scene.frame_set(so.nova.frame_start)  # restart the live simulation in the new cache

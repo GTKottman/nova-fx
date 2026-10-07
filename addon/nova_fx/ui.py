@@ -32,7 +32,7 @@ class NOVA_PT_main(_Panel, bpy.types.Panel):
         if ob is None:
             return
         sysob = _sys(context)
-        if ob.nova.is_system:
+        if ob.nova.is_system or ob.nova_lightning.enabled:
             return
         col = layout.column(align=True)
         row = col.row(align=True)
@@ -331,6 +331,47 @@ class NOVA_PT_force(_Panel, bpy.types.Panel):
             layout.prop(f, "freq")
 
 
+class NOVA_PT_lightning(_Panel, bpy.types.Panel):
+    bl_label = "Lightning"
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.object
+        return ob is not None and ob.nova_lightning.enabled
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        ob = context.object
+        lt = ob.nova_lightning
+        row = layout.row(align=True)
+        row.scale_y = 1.3
+        row.operator("nova.lightning_regrow", icon="FILE_REFRESH").new_seed = False
+        row.operator("nova.lightning_regrow", text="New Seed", icon="SHADERFX").new_seed = True
+        if "nova_strike" in ob:
+            x, y, z = ob["nova_strike"]
+            layout.label(text=f"Strikes at {x:.1f}, {y:.1f}, {z:.1f}", icon="CHECKMARK")
+        else:
+            layout.label(text="Never reaches the ground: raise Directness", icon="ERROR")
+        header, body = layout.panel("nova_lightning_shape", default_closed=False)
+        header.label(text="Shape")
+        if body:
+            for prop in ("seed", "ground", "target", "branching", "field", "segment", "prune", "detail",
+                         "roughness", "radius"):
+                body.prop(lt, prop)
+        header, body = layout.panel("nova_lightning_timing", default_closed=False)
+        header.label(text="Timing")
+        if body:
+            for prop in ("strike_frame", "leader_frames", "strokes", "stroke_gap", "afterglow"):
+                body.prop(lt, prop)
+        header, body = layout.panel("nova_lightning_look", default_closed=True)
+        header.label(text="Look")
+        if body:
+            for prop in ("brightness", "branch_glow", "temperature", "light_power", "impact"):
+                body.prop(lt, prop)
+
+
 class NOVA_MT_add(bpy.types.Menu):
     bl_label = "Nova FX"
     bl_idname = "NOVA_MT_add"
@@ -346,4 +387,4 @@ def menu_add(self, context):
 
 
 CLASSES = (NOVA_UL_kinds, NOVA_PT_main, NOVA_PT_system, NOVA_PT_types, NOVA_PT_forces, NOVA_PT_fluid,
-           NOVA_PT_display, NOVA_PT_emitter, NOVA_PT_collider, NOVA_PT_force, NOVA_MT_add)
+           NOVA_PT_display, NOVA_PT_emitter, NOVA_PT_collider, NOVA_PT_force, NOVA_PT_lightning, NOVA_MT_add)
