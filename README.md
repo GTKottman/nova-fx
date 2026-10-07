@@ -80,8 +80,14 @@ don't pass through the thin ears. <a href="examples/grinder_monkey.py">grinder_m
 <td><img src="docs/examples/meteor_shower.webp" alt="Meteor shower"><br>
 <b>Meteor shower</b>: a custom effect written from scratch (below), with no preset involved.
 <a href="examples/meteor_shower.py">meteor_shower.py</a></td>
-<td><img src="docs/presets.png" alt="All presets"><br>
-<b>Every preset</b> straight out of <i>Add Effect</i>, untouched.</td>
+<td><img src="docs/examples/lightning_storm.webp" alt="Lightning storm"><br>
+<b>Lightning storm</b>: bolts grown by the dielectric breakdown model. A stepped leader, return strokes
+that light the cloud deck from inside, re-strikes down the hot channel, an afterglow that cools to orange,
+and one bolt drawn to a lightning rod. <a href="examples/lightning_storm.py">lightning_storm.py</a></td>
+</tr>
+<tr>
+<td colspan="2"><img src="docs/presets.png" alt="Presets"><br>
+<b>The presets</b> straight out of <i>Add Effect</i>, untouched.</td>
 </tr>
 </table>
 
@@ -197,8 +203,9 @@ Press Play to watch it live, or *Bake* to cache it to disk. The same settings ap
   and loaded as a Blender Volume sequence with a blackbody fire material.
 
 ### GPU fluid (Vulkan)
-- **Setting:** `Fire & Smoke → Device: GPU` runs the whole fluid substep in Vulkan compute (`core/gpu_vk.c`,
-  `core/shaders/*.comp`) with the state resident in VRAM.
+- **Setting:** `Fire & Smoke → Device` is GPU by default. It runs the whole fluid substep in Vulkan compute
+  (`core/gpu_vk.c`, `core/shaders/*.comp`) with the state resident in VRAM. Without a Vulkan GPU, or when the
+  domain doesn't fit in VRAM, the same simulation runs on the CPU and the panel says so.
 - **Same solver:** it mirrors the CPU one kernel for kernel, and the tests check that, dense and sparse: identical
   after one frame, and after 8–16 frames no cell off by more than 0.5% of peak. Repeated runs give bit-identical results.
 - **Sparse like the CPU:** every kernel runs one workgroup per active 8³ tile (the multigrid levels per active

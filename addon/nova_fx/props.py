@@ -105,8 +105,9 @@ def _fluid_annotations():
     ann["enabled"] = BoolProperty(name="Fluid", default=False, description="Simulate smoke and fire on a grid")
     ann["device"] = EnumProperty(name="Device", items=[
         ("CPU", "CPU", "Solver on all CPU cores"),
-        ("GPU", "GPU", "Vulkan compute on the graphics card: usually several times faster than the CPU"),
-    ], default="CPU", description="Where the fire and smoke solver runs (results match to rounding)")
+        ("GPU", "GPU", "Vulkan compute on the graphics card: usually several times faster than the CPU. "
+                       "Runs on the CPU instead when there is no Vulkan GPU or the domain does not fit"),
+    ], default="GPU", description="Where the fire and smoke solver runs (results match to rounding)")
     ann["domain"] = PointerProperty(name="Domain", type=bpy.types.Object,
                                     description="Box object that bounds the fluid")
     ann["resolution"] = IntProperty(name="Resolution", default=96, min=16, max=512,

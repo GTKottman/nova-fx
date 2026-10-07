@@ -148,7 +148,7 @@ def ensure_fluid(rt, sysob):
             if rt.fluid.use_gpu(True):
                 rt.gpu_note = "GPU: " + core.gpu_name()
             else:
-                rt.gpu_note = "GPU unavailable, using CPU: " + core.gpu_name()
+                rt.gpu_note = "CPU (no GPU available: " + core.gpu_name() + ")"
         rt.sys.set_fluid(rt.fluid)
 
 
