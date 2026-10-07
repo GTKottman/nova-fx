@@ -49,7 +49,7 @@ VK_FUNCS(DECL)
 #undef DECL
 
 /* pipelines, one per shader */
-#define SHADERS(X) X(adv_scalars) X(adv_face) X(combust) X(forces) X(faces) X(project) X(mg) X(cg) X(splat) X(tilemax) X(mg_small)
+#define SHADERS(X) X(adv_scalars) X(adv_face) X(combust) X(forces) X(faces) X(project) X(mg) X(cg) X(splat) X(tilemax)
 #define SH_ENUM(n) SH_##n,
 enum { SHADERS(SH_ENUM) SH_COUNT };
 
@@ -282,14 +282,13 @@ API const char *nv_gpu_name(void) { return G.ready ? G.name : G.err; }
 
 #define MAXLEV 16
 #define MAXIT_BATCH 6
-#define SMALL_LEVEL_CELLS 32768 /* levels at or below this size run fused in one workgroup */
 
 typedef struct GpuFluid {
   int nx, ny, nz;
   size_t nc, nu, nv, nw;
   float dx, o[3];
   int ntx, nty, ntz, nt;
-  Buf F, S, R, P, PI, stage;
+  Buf F, S, R, P, PI, stage, RB; /* R: GPU scalars + partials (device local); RB: host readback */
   VkDescriptorSet ds;
   VkCommandBuffer cmd;
   int recording;
@@ -298,8 +297,7 @@ typedef struct GpuFluid {
   /* multigrid levels */
   int nlev, lx[MAXLEV], ly[MAXLEV], lz[MAXLEV];
   uint32_t lvx[MAXLEV], lvb[MAXLEV], lvr[MAXLEV], lst[MAXLEV]; /* x, b, r in F; stencil in S */
-  uint32_t solid_off, perm_off, lvl_off;
-  int small_from; /* first level handled by the fused kernel */
+  uint32_t solid_off, perm_off;
   /* R layout (floats) */
   uint32_t r_part, r_part2, r_npart;
   int last_iters;
@@ -443,18 +441,27 @@ static int download(GpuFluid *g, const Buf *src, VkDeviceSize off, void *dst, si
   return 0;
 }
 
+static void zero(GpuFluid *g, Buf *b) {
+  begin(g);
+  vkCmdFillBuffer_(g->cmd, b->buf, 0, VK_WHOLE_SIZE, 0);
+  barrier(g);
+  flush(g);
+}
+
 static int ensure_points(GpuFluid *g, size_t pts_bytes, size_t idx_bytes) {
   int changed = 0;
   if (pts_bytes > g->P.size) {
     flush(g);
     buf_free(&g->P);
     if (buf_create(&g->P, pts_bytes + pts_bytes / 2, 0)) return -1;
+    if (getenv("NOVA_GPU_ZERO_ALL")) zero(g, &g->P);
     changed = 1;
   }
   if (idx_bytes > g->PI.size) {
     flush(g);
     buf_free(&g->PI);
     if (buf_create(&g->PI, idx_bytes + idx_bytes / 2, 0)) return -1;
+    if (getenv("NOVA_GPU_ZERO_ALL")) zero(g, &g->PI);
     changed = 1;
   }
   if (changed) write_set(g);
@@ -509,10 +516,6 @@ HIDDEN GpuFluid *gpuf_new(int nx, int ny, int nz, float dx, const float *o, int 
     soff += (size_t)g->lx[l] * g->ly[l] * g->lz[l];
   }
   g->perm_off = (uint32_t)soff; soff += 512;
-  g->lvl_off = (uint32_t)soff; soff += 7 * (size_t)nlev;
-  g->small_from = nlev - 1;
-  for (int l = nlev - 1; l >= 1; l--)
-    if ((size_t)g->lx[l] * g->ly[l] * g->lz[l] <= SMALL_LEVEL_CELLS) g->small_from = l;
   size_t parts = cdiv((int)g->nc, 256) + cdiv(nx + 1, 8) * cdiv(ny + 1, 8) * cdiv(nz + 1, 4) + (size_t)g->nt + 64;
   g->r_npart = (uint32_t)parts;
   g->r_part = 128;
@@ -524,8 +527,10 @@ HIDDEN GpuFluid *gpuf_new(int nx, int ny, int nz, float dx, const float *o, int 
   ca.commandPool = G.pool;
   ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
   ca.commandBufferCount = 1;
-  if (vkAllocateCommandBuffers_(G.dev, &ca, &g->cmd) || buf_create(&g->F, off * sizeof(float), 0) ||
-      buf_create(&g->S, soff * sizeof(uint32_t), 0) || buf_create(&g->R, (128 + 2 * parts) * sizeof(float), 1) ||
+  size_t pad = getenv("NOVA_GPU_PAD") ? (size_t)atol(getenv("NOVA_GPU_PAD")) : 0; /* debugging */
+  if (vkAllocateCommandBuffers_(G.dev, &ca, &g->cmd) || buf_create(&g->F, (off + pad) * sizeof(float), 0) ||
+      buf_create(&g->S, (soff + pad) * sizeof(uint32_t), 0) || buf_create(&g->R, (128 + 2 * parts) * sizeof(float), 0) ||
+      buf_create(&g->RB, (128 + (size_t)g->nt) * sizeof(float), 1) ||
       buf_create(&g->P, 4096, 0) || buf_create(&g->PI, 4096, 0) || buf_create(&g->stage, stage_bytes, 1)) {
     gpuf_free(g);
     return NULL;
@@ -542,11 +547,18 @@ HIDDEN GpuFluid *gpuf_new(int nx, int ny, int nz, float dx, const float *o, int 
   begin(g);
   vkCmdFillBuffer_(g->cmd, g->F.buf, 0, VK_WHOLE_SIZE, 0);
   vkCmdFillBuffer_(g->cmd, g->S.buf, 0, VK_WHOLE_SIZE, 0);
+  if (pad && getenv("NOVA_GPU_CANARY")) { /* debugging: poison the padding to catch reads past the end */
+    vkCmdFillBuffer_(g->cmd, g->F.buf, off * sizeof(float), pad * sizeof(float), 0x7149F2CAu); /* 1e30f */
+    vkCmdFillBuffer_(g->cmd, g->S.buf, soff * sizeof(uint32_t), pad * sizeof(uint32_t),
+                     (uint32_t)atol(getenv("NOVA_GPU_CANARY")));
+  }
   barrier(g);
   flush(g);
-  float *R = (float *)g->R.map;
-  memset(R, 0, g->R.size);
-  R[R_ONE] = 1.f;
+  begin(g); /* scalar constants live on the GPU: R[R_ZERO] = 0, R[R_ONE] = 1 */
+  vkCmdFillBuffer_(g->cmd, g->R.buf, 0, VK_WHOLE_SIZE, 0);
+  vkCmdFillBuffer_(g->cmd, g->R.buf, R_ONE * sizeof(float), sizeof(float), 0x3F800000u);
+  barrier(g);
+  flush(g);
   if (G.ts_ok) {
     VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
     qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -562,7 +574,7 @@ HIDDEN void gpuf_free(GpuFluid *g) {
   if (!g) return;
   flush(g);
   vkDeviceWaitIdle_(G.dev);
-  Buf *bs[] = {&g->F, &g->S, &g->R, &g->P, &g->PI, &g->stage};
+  Buf *bs[] = {&g->F, &g->S, &g->R, &g->P, &g->PI, &g->stage, &g->RB};
   for (size_t i = 0; i < sizeof bs / sizeof *bs; i++) buf_free(bs[i]);
   if (g->ds) vkFreeDescriptorSets_(G.dev, G.dpool, 1, &g->ds);
   if (g->qp) vkDestroyQueryPool_(G.dev, g->qp, NULL);
@@ -582,7 +594,7 @@ HIDDEN void gpuf_set_stencils(GpuFluid *g, const uint8_t *solid, uint8_t *const 
                               const uint8_t *perm) {
   size_t total = g->nc;
   for (int l = 0; l < g->nlev; l++) total += (size_t)g->lx[l] * g->ly[l] * g->lz[l];
-  total += 512 + 7 * (size_t)g->nlev;
+  total += 512;
   uint32_t *s = (uint32_t *)malloc(total * sizeof(uint32_t));
   for (size_t c = 0; c < g->nc; c++) s[c] = solid[c];
   for (int l = 0; l < g->nlev; l++) {
@@ -592,11 +604,6 @@ HIDDEN void gpuf_set_stencils(GpuFluid *g, const uint8_t *solid, uint8_t *const 
     for (size_t c = 0; c < n; c++) d[c] = (uint32_t)diag[l][c] | ((uint32_t)nb[l][c] << 8);
   }
   for (int i = 0; i < 512; i++) s[g->perm_off + i] = perm[i];
-  for (int l = 0; l < g->nlev; l++) {
-    uint32_t *t = s + g->lvl_off + 7 * l;
-    t[0] = (uint32_t)g->lx[l]; t[1] = (uint32_t)g->ly[l]; t[2] = (uint32_t)g->lz[l];
-    t[3] = g->lvx[l]; t[4] = g->lvb[l]; t[5] = g->lvr[l]; t[6] = g->lst[l];
-  }
   upload(g, &g->S, 0, s, total * sizeof(uint32_t));
   free(s);
 }
@@ -609,19 +616,32 @@ static void reduce(GpuFluid *g, uint32_t part, uint32_t n, uint32_t dst, int is_
   disp(g, SH_cg, &p, 1, 1, 1);
 }
 
+/* copy R[first .. first+count) into the host readback buffer and wait; returns its mapping */
+static const float *fetch(GpuFluid *g, uint32_t first, uint32_t count) {
+  begin(g);
+  VkBufferCopy cp = {(VkDeviceSize)first * sizeof(float), 0, (VkDeviceSize)count * sizeof(float)};
+  vkCmdCopyBuffer_(g->cmd, g->R.buf, g->RB.buf, 1, &cp);
+  barrier(g);
+  flush(g);
+  return (const float *)g->RB.map;
+}
+
 static void vcycle(GpuFluid *g, int l) {
-  if (l >= g->small_from) { /* the rest of the cycle in one workgroup */
-    PC s;
-    pc_init(&s, l, g->nlev - 1, 12, 0);
-    s.o0[0] = g->lvl_off;
-    disp(g, SH_mg_small, &s, 1, 1, 1);
-    return;
-  }
   int nx = g->lx[l], ny = g->ly[l], nz = g->lz[l];
   uint32_t gx = cdiv(nx, 8), gy = cdiv(ny, 8), gz = cdiv(nz, 4);
   PC p;
   pc_init(&p, nx, ny, nz, 1);
   p.o0[0] = g->lvx[l]; p.o0[1] = g->lvb[l]; p.o0[2] = g->lvr[l]; p.o0[3] = g->lst[l];
+  if (l == g->nlev - 1) { /* coarsest level: smooth to convergence, symmetric order (as on the CPU) */
+    p.n[3] = 0;
+    disp(g, SH_mg, &p, gx, gy, gz);
+    p.n[3] = 1;
+    for (int s = 0; s < 12; s++)
+      for (int c = 0; c < 2; c++) { p.o1[0] = (uint32_t)c; disp(g, SH_mg, &p, gx, gy, gz); }
+    for (int s = 0; s < 12; s++)
+      for (int c = 1; c >= 0; c--) { p.o1[0] = (uint32_t)c; disp(g, SH_mg, &p, gx, gy, gz); }
+    return;
+  }
   /* pre-smooth from x = 0: the first red sweep needs no neighbours, so no zeroing pass */
   for (int s = 0; s < 2; s++)
     for (int c = 0; c < 2; c++) {
@@ -649,7 +669,6 @@ static void vcycle(GpuFluid *g, int l) {
 /* MGPCG on level 0: solve A phi = cb. CG scalars stay on the GPU; the host syncs once per batch. */
 static void solve(GpuFluid *g, const float *fp) {
   uint32_t n = (uint32_t)g->nc, ng = cdiv((int)n, 256);
-  float *R = (float *)g->R.map;
   PC p;
   pc_init(&p, (int)n, g->nx, g->ny, 4);
   p.o0[0] = g->phi; p.o0[1] = g->cb; p.o0[2] = g->cr; p.o0[3] = g->lst[0];
@@ -657,7 +676,7 @@ static void solve(GpuFluid *g, const float *fp) {
   disp(g, SH_cg, &p, ng, 1, 1);
   reduce(g, g->r_part, ng, R_RMAX0, 1);
   reduce(g, g->r_part2, ng, R_BMAX, 1);
-  flush(g);
+  const float *R = fetch(g, 0, 128);
   float bmax = R[R_BMAX], rmax = R[R_RMAX0];
   g->last_iters = 0;
   g->last_res = 0.f;
@@ -707,7 +726,7 @@ static void solve(GpuFluid *g, const float *fp) {
       disp(g, SH_cg, &p, ng, 1, 1);
       cur = 1 - cur;
     }
-    flush(g);
+    R = fetch(g, 0, 128);
     for (int b = 0; b < batch; b++) {
       it++;
       rmax = R[R_RMAXIT + b];
@@ -770,6 +789,7 @@ static void add_forces(GpuFluid *g, uint32_t U, uint32_t V, uint32_t W, float dt
     p.f0[1] = 0.5f / g->dx;
     disp(g, SH_forces, &p, gx, gy, gz);
     pc_init(&p, nx, ny, nz, 2);
+    p.o0[0] = U; p.o0[1] = V; p.o0[2] = W; /* local speed limits the noise push */
     p.o0[3] = g->sc;
     p.o1[0] = g->tmp; p.o1[1] = g->sc + (uint32_t)g->nc; p.o1[2] = g->perm_off;
     p.o1[3] = (uint32_t)fp[FP_seed] * 7919u + 17u;
@@ -797,6 +817,7 @@ static void faces_op(GpuFluid *g, int op, uint32_t dU, uint32_t dV, uint32_t dW,
   PC p;
   pc_init(&p, g->nx, g->ny, g->nz, op);
   p.o0[0] = dU; p.o0[1] = dV; p.o0[2] = dW; p.o1[0] = sU; p.o1[1] = sV; p.o1[2] = sW;
+  p.o2[0] = g->lst[0];
   p.f0[0] = f;
   disp(g, SH_faces, &p, cdiv(g->nx + 1, 8), cdiv(g->ny + 1, 8), cdiv(g->nz + 1, 4));
 }
@@ -887,8 +908,7 @@ HIDDEN float gpuf_max_speed(GpuFluid *g) {
   uint32_t gx = cdiv(g->nx + 1, 8), gy = cdiv(g->ny + 1, 8), gz = cdiv(g->nz + 1, 4);
   disp(g, SH_faces, &p, gx, gy, gz);
   reduce(g, g->r_part, gx * gy * gz, R_MAXV, 1);
-  flush(g);
-  return ((float *)g->R.map)[R_MAXV];
+  return fetch(g, 0, 128)[R_MAXV];
 }
 
 /* Bucket points into the tiles they can reach, upload, run the gather kernel.
@@ -1048,8 +1068,7 @@ HIDDEN int gpuf_active_bbox(GpuFluid *g, int *b) {
   pc_init(&p, g->nx, g->ny, g->nz, 0);
   p.o0[0] = g->sc; p.o2[0] = g->r_part;
   disp(g, SH_tilemax, &p, (uint32_t)g->ntx, (uint32_t)g->nty, (uint32_t)g->ntz);
-  flush(g);
-  const float *R = (const float *)g->R.map + g->r_part;
+  const float *R = fetch(g, g->r_part, (uint32_t)g->nt);
   int lo[3] = {1 << 30, 1 << 30, 1 << 30}, hi[3] = {-1, -1, -1};
   for (int t = 0; t < g->nt; t++) {
     if (R[t] <= 1e-4f) continue;

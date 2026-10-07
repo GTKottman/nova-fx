@@ -855,6 +855,13 @@ static void advect_scalar(NvFluid *f, const float *src, float *hat, const float 
   }
 }
 
+/* MacCormack's error estimate is meaningless where a trace leaves the grid (the samples are clamped,
+ * so back and forward traces don't retrace each other); there the face falls back to semi-Lagrangian.
+ * Without this, faces at open boundaries amplify a little every step and a narrow domain blows up. */
+static inline int outside(float x, float y, float z, int sx, int sy, int sz) {
+  return x < 0.f || y < 0.f || z < 0.f || x > (float)(sx - 1) || y > (float)(sy - 1) || z > (float)(sz - 1);
+}
+
 /* advect one face component over the pressure tiles (copy-through outside the advection tiles).
  * comp 0=u 1=v 2=w. U,V,W = tracing velocity. */
 static void advect_face(NvFluid *f, int comp, const float *src, float *dst, const float *U, const float *V,
@@ -880,6 +887,7 @@ static void advect_face(NvFluid *f, int comp, const float *src, float *dst, cons
           trace(f, U, V, W, i + ox, j + oy, k + oz, h, p);
           float mn, mx;
           dst[c] = samp_mm(src, sx, sy, sz, p[0] - ox, p[1] - oy, p[2] - oz, 0, &mn, &mx);
+          if (outside(p[0] - ox, p[1] - oy, p[2] - oz, sx, sy, sz)) mn = INFINITY, mx = -INFINITY; /* forces SL */
           mnA[c] = mn;
           mxA[c] = mx;
         }
@@ -898,7 +906,8 @@ static void advect_face(NvFluid *f, int comp, const float *src, float *dst, cons
           trace(f, U, V, W, i + ox, j + oy, k + oz, -h, p);
           float til = samp(dst, sx, sy, sz, p[0] - ox, p[1] - oy, p[2] - oz, 0);
           float val = dst[c] + 0.5f * (src[c] - til);
-          mnA[c] = (val < mnA[c] || val > mxA[c]) ? dst[c] : val;
+          int sl = val < mnA[c] || val > mxA[c] || outside(p[0] - ox, p[1] - oy, p[2] - oz, sx, sy, sz);
+          mnA[c] = sl ? dst[c] : val;
         }
   }
 #pragma omp parallel for schedule(dynamic, 1)
@@ -1435,6 +1444,11 @@ static inline void cvel(const NvFluid *f, const float *U, const float *V, const 
   o[2] = 0.5f * (W[WI(f, i, j, k)] + W[WI(f, i, j, k + 1)]);
 }
 
+static inline void cvel3(const float *U, const float *V, const float *W, const NvFluid *f, int i, int j, int k,
+                         float *o) {
+  cvel(f, U, V, W, i, j, k, o);
+}
+
 static void add_forces_(NvFluid *f, float *U, float *V, float *W, float dt) {
   int nx = f->nx, ny = f->ny, nz = f->nz;
   float dx = f->dx;
@@ -1507,11 +1521,16 @@ static void add_forces_(NvFluid *f, float *U, float *V, float *W, float dt) {
               float wgt = fminf(1.f, f->d[c] + f->T[c]);
               if (wgt > 1e-3f) {
                 float X = f->o[0] + (i + .5f) * dx, Y = f->o[1] + (j + .5f) * dx, Z = f->o[2] + (k + .5f) * dx;
-                float cn[3];
+                float cn[3], cv[3];
                 curl_noise(X * tf, Y * tf, Z * tf, tt, 2, seed, cn);
-                fx += tamp * wgt * cn[0];
-                fy += tamp * wgt * cn[1];
-                fz += tamp * wgt * cn[2];
+                /* noise stirs the gas but must not pump energy forever (inviscid: nothing removes it):
+                 * the push fades out as the local speed approaches 0.5 * amplitude (m/s) */
+                cvel3(U, V, W, f, i, j, k, cv);
+                float sp = sqrtf(cv[0] * cv[0] + cv[1] * cv[1] + cv[2] * cv[2]);
+                float lim = fmaxf(0.f, 1.f - sp / (0.5f * tamp));
+                fx += tamp * wgt * lim * cn[0];
+                fy += tamp * wgt * lim * cn[1];
+                fz += tamp * wgt * lim * cn[2];
               }
             }
             Fx[c] = fx; Fy[c] = fy; Fz[c] = fz;
@@ -1653,8 +1672,20 @@ static void faces_op(NvFluid *f, int op) {
           float *d = dst[comp] + c;
           const float *s1 = src[comp] + c;
           int len = b[1] - b[0];
-          if (op == 0) memcpy(d, s1, sizeof(float) * len);
-          else for (int i = 0; i < len; i++) d[i] = 2.f * s1[i] - d[i];
+          if (op == 0) {
+            memcpy(d, s1, sizeof(float) * len);
+            continue;
+          }
+          for (int ii = 0; ii < len; ii++) {
+            /* reflect only between two fluid cells: next to air (open boundary, outside the sparse
+             * region) or a solid, reflection doubles an unconstrained correction every step and the
+             * boundary faces run away, so those keep the projected value */
+            int i = b[0] + ii;
+            int i0 = i - (comp == 0), j0 = j - (comp == 1), k0 = k - (comp == 2);
+            int inside = i0 >= 0 && j0 >= 0 && k0 >= 0 && i < f->nx && j < f->ny && k < f->nz;
+            int fluid = inside && f->ctype[CI(f, i0, j0, k0)] == 0 && f->ctype[CI(f, i, j, k)] == 0;
+            d[ii] = fluid ? 2.f * s1[ii] - d[ii] : s1[ii];
+          }
         }
     }
   }
@@ -1717,6 +1748,9 @@ API double nv_fluid_bench_advect(NvFluid *f, float dt, int iters) {
   for (int i = 0; i < iters; i++) advect_scalars(f, f->u, f->v, f->w, dt);
   return (now_ms() - t0) / iters;
 }
+
+/* diagnostics: fastest face velocity right now (CPU or GPU path) */
+API float nv_fluid_max_speed(NvFluid *f) { return max_speed(f); }
 
 API void nv_fluid_step(NvFluid *f, float dt) {
   ftz();

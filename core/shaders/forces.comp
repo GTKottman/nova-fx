@@ -104,7 +104,9 @@ void main() {
       float wgt = min(1.0, F[pc.o0.w + c] + F[pc.o1.y + c]);
       if (wgt > 1e-3) {
         vec3 X = vec3(pc.f1.z, pc.f1.w, pc.f2.x) + (vec3(g) + 0.5) * pc.f1.y;
-        fo += tamp * wgt * curl_noise(X * pc.f0.w, pc.f1.x, 2, pc.o1.w);
+        // the push fades out as the local speed approaches 0.5 * amplitude (see nova_core.c)
+        float lim = max(0.0, 1.0 - length(cvel(g.x, g.y, g.z)) / (0.5 * tamp));
+        fo += tamp * wgt * lim * curl_noise(X * pc.f0.w, pc.f1.x, 2, pc.o1.w);
       }
     }
     F[T + 4u * nc + c] = fo.x; F[T + 5u * nc + c] = fo.y; F[T + 6u * nc + c] = fo.z;

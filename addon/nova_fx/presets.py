@@ -84,6 +84,52 @@ def _mesh(coll, name, build, loc=(0, 0, 0), rot=(0, 0, 0), mat=None):
     return ob
 
 
+def _charred_wood(name="Nova Charred Wood"):
+    """Black, cracked bark; the cracks glow like embers (emission masked by Voronoi cell edges)."""
+    mat = bpy.data.materials.get(name)
+    if mat:
+        return mat
+    mat = bpy.data.materials.new(name)
+    mat.use_nodes = True
+    nt = mat.node_tree
+    bsdf = next(n for n in nt.nodes if n.type == "BSDF_PRINCIPLED")
+    bsdf.inputs["Roughness"].default_value = 0.9
+    vor = nt.nodes.new("ShaderNodeTexVoronoi")
+    vor.feature = "DISTANCE_TO_EDGE"
+    vor.inputs["Scale"].default_value = 22.0
+    vor.inputs["Randomness"].default_value = 0.9
+    crack = nt.nodes.new("ShaderNodeMapRange")          # thin bright lines along the cell edges
+    crack.inputs["From Min"].default_value = 0.0
+    crack.inputs["From Max"].default_value = 0.06
+    crack.inputs["To Min"].default_value = 1.0
+    crack.inputs["To Max"].default_value = 0.0
+    noise = nt.nodes.new("ShaderNodeTexNoise")          # not every crack is equally hot
+    noise.inputs["Scale"].default_value = 4.0
+    heat = nt.nodes.new("ShaderNodeMath")
+    heat.operation = "MULTIPLY"
+    hot = nt.nodes.new("ShaderNodeMapRange")
+    hot.inputs["From Min"].default_value = 0.45
+    hot.inputs["From Max"].default_value = 0.7
+    strength = nt.nodes.new("ShaderNodeMath")
+    strength.operation = "MULTIPLY"
+    strength.inputs[1].default_value = 6.0
+    bark = nt.nodes.new("ShaderNodeValToRGB")          # ash-grey to black bark
+    bark.color_ramp.elements[0].color = (0.006, 0.005, 0.004, 1)
+    bark.color_ramp.elements[1].color = (0.05, 0.045, 0.04, 1)
+    L = nt.links.new
+    L(vor.outputs["Distance"], crack.inputs["Value"])
+    L(noise.outputs["Fac"], hot.inputs["Value"])
+    L(crack.outputs["Result"], heat.inputs[0])
+    L(hot.outputs["Result"], heat.inputs[1])
+    L(heat.outputs["Value"], strength.inputs[0])
+    L(strength.outputs["Value"], bsdf.inputs["Emission Strength"])
+    L(noise.outputs["Fac"], bark.inputs["Fac"])
+    L(bark.outputs["Color"], bsdf.inputs["Base Color"])
+    bsdf.inputs["Emission Color"].default_value = (1.0, 0.22, 0.03, 1)
+    mat.diffuse_color = (0.02, 0.015, 0.012, 1)
+    return mat
+
+
 def _plain_material(name, color, rough=0.8, emit=None, emit_strength=0.0):
     mat = bpy.data.materials.get(name) or bpy.data.materials.new(name)
     if not mat.node_tree:
@@ -320,7 +366,7 @@ def build_campfire(context, coll):
                    flame_decay=6.0, smoke_decay=0.15, density_mult=4.0, flame_mult=2.0, heat_mult=1.2))
     domain(coll, s, (1.6, 1.6, 2.6), (0, 0, 1.3), 96)
     ground(coll, 8)
-    log_mat = _plain_material("Nova Charred Wood", (0.015, 0.011, 0.009), 0.95, (1.0, 0.25, 0.05), 0.15)
+    log_mat = _charred_wood()
     for i in range(4):
         a = i * math.pi / 2 + 0.4
         _mesh(coll, f"Log {i + 1}", lambda bm: bmesh.ops.create_cone(bm, cap_ends=True, segments=10,
@@ -359,10 +405,10 @@ def build_explosion(context, coll):
            trail_kind="Debris Trail", trail_rate=30, fl_smoke=1.5, fl_heat=0.6),
         bb("Debris Trail", 1600, (0.3, 0.8), (0.035, 0.0), 6, drag_lin=2.0, cool=1.0),
     ], frame_end=120, substeps=2,
-        fluid=dict(buoy_heat=1.6, buoy_smoke=0.25, vorticity=1.0, turb_amp=5.0, turb_freq=0.5, cool=0.35,
+        fluid=dict(buoy_heat=3.0, buoy_smoke=0.04, vorticity=1.0, turb_amp=5.0, turb_freq=0.5, cool=0.5,
                    cool_rad=0.12, burn_rate=3.0, heat_release=2.0, ignite=0.15, smoke_yield=1.5, expansion=8.0,
-                   flame_decay=2.5, smoke_decay=0.02, density_mult=2.5, flame_mult=3.0, heat_mult=1.5,
-                   max_sub=4, smoke_color=(0.08, 0.075, 0.07)))
+                   flame_decay=2.5, smoke_decay=0.02, density_mult=1.2, flame_mult=3.0, heat_mult=0.8,
+                   max_sub=4, smoke_color=(0.22, 0.21, 0.2)))
     domain(coll, s, (16, 16, 16), (0, 0, 8), 96)
     ground(coll, 60)
     emitter(coll, s, "Blast Core", "", (0, 0, 1.5), size=1.2, shape="SPHERE", radius=1.2, rate=0,
