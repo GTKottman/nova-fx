@@ -33,6 +33,8 @@ def setup():
         if getattr(c, "bl_category", None) == "Nova FX":
             bpy.utils.unregister_class(c)
             c.bl_category = "Item"
+            if hasattr(c, "bl_options"):
+                c.bl_options = set()  # open every panel for the screenshot
             bpy.utils.register_class(c)
     for n in ("VIEW3D_PT_transform", "OBJECT_PT_transform"):
         c = getattr(bpy.types, n, None)
@@ -50,6 +52,8 @@ def setup():
     with bpy.context.temp_override(window=w, area=a):
         bpy.ops.nova.add_preset(preset="CAMPFIRE")
     L("campfire added", bpy.context.object.name)
+    if os.environ.get("NOVA_DEVICE"):
+        bpy.context.object.nova.fluid.device = os.environ["NOVA_DEVICE"]
     for f in range(1, 25):
         bpy.context.scene.frame_set(f)
 

@@ -105,6 +105,20 @@ make -C core
 - **Output:** OpenVDB (`density`, `heat`, `flame`, optional `velocity`) written on a background thread
   and loaded as a Blender Volume sequence with a blackbody fire material.
 
+### GPU fluid (Vulkan)
+- **Setting:** `Fire & Smoke → Device: GPU` runs the whole fluid substep in Vulkan compute (`core/gpu_vk.c`,
+  `core/shaders/*.comp`) with the state resident in VRAM.
+- **Same solver:** it mirrors the CPU one kernel for kernel, and the tests check that. Identical after one frame,
+  within 0.0012% after eight.
+- **Pressure solve:** MGPCG with the CG scalars kept on the GPU. The host syncs once per batch of 4 iterations.
+- **Sources and deposits:** bucketed by tile on the CPU and gathered per cell on the GPU. No atomics, so results
+  are deterministic.
+- **Transfers:** the CPU keeps the bookkeeping (solids, multigrid stencils, which are uploaded only when they
+  change). Fields come back only for VDB export, and velocity only for particles that ride the flow.
+- **Build:** `libvulkan` is loaded at runtime. Shaders are compiled with `glslc` and committed as SPIR-V
+  (`core/shaders_spv.h`), so building never needs a shader compiler. Without Vulkan, the add-on falls back to CPU.
+- **Limitation:** the GPU solver is dense. For a small fire in a huge domain, the sparse CPU solver can still be faster.
+
 ### Blender side
 - Native **PointCloud** objects with these attributes: `position`, `radius`, `Cd`, `emit`, `velocity`
   (Cycles motion blur), `age`, `id`, `kind`. Usable in your own shaders and Geometry Nodes.
@@ -148,10 +162,10 @@ blender -b --factory-startup --python tests/blender_render.py -- FIREWORKS 260 o
 ## Researched, not built (yet)
 
 From the paid tools (X-Particles, tyFlow, EmberGen, Pro Pyro, VFX Pro Simulations):
-- GPU solver: EmberGen, Zenith and Pro Pyro run on the GPU; this is a 16-core CPU core.
 - FLIP/APIC liquids, granular, cloth
 - An OpenVDB mesher for particles
 - ML upres
 - A domain that follows the effect around (sparse tiles cover most of that benefit)
 - Tile-ordered grid storage (memory proportional to the effect; pages are currently row-shaped)
 - SIMD (8-wide) turbulence noise
+- Sparse GPU dispatch (active tiles only) and GPU particles

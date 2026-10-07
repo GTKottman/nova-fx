@@ -1,0 +1,112 @@
+#version 450
+// The bottom of the multigrid V-cycle in ONE workgroup: every level from n.x down to the coarsest and
+// back up, with workgroup barriers between steps instead of separate dispatches. Small levels are
+// dominated by dispatch overhead, so this replaces ~60 tiny dispatches per V-cycle with one.
+// Level table in S at o0.x: per level (nx, ny, nz, x off, b off, r off, stencil off).
+// Same operations, same order as the dispatch-based path in gpu_vk.c (and vcycle() in nova_core.c).
+layout(local_size_x = 1024) in;
+layout(std430, binding = 0) coherent buffer BF { float F[]; };
+layout(std430, binding = 2) readonly buffer BS { uint S[]; };
+layout(push_constant) uniform PC {
+  ivec4 n;   // first level, last level, coarse sweeps, -
+  uvec4 o0;  // level table offset
+  uvec4 o1, o2;
+  vec4 f0, f1, f2;
+} pc;
+
+uint L(int l, int k) { return S[pc.o0.x + uint(7 * l + k)]; }
+
+void sync_() { memoryBarrierBuffer(); barrier(); }
+
+void zero_x(int l) {
+  uint n = L(l, 0) * L(l, 1) * L(l, 2), X = L(l, 3);
+  for (uint c = gl_LocalInvocationIndex; c < n; c += 1024u) F[X + c] = 0.0;
+  sync_();
+}
+
+void rbgs(int l, int color) {
+  uint nx = L(l, 0), ny = L(l, 1), nz = L(l, 2), X = L(l, 3), B = L(l, 4), ST = L(l, 6);
+  uint n = nx * ny * nz, sy = nx, sz = nx * ny;
+  for (uint c = gl_LocalInvocationIndex; c < n; c += 1024u) {
+    uint i = c % nx, j = (c / nx) % ny, k = c / sz;
+    if (((i + j + k + uint(color)) & 1u) != 0u) continue;
+    uint w = S[ST + c], dg = w & 255u, m = w >> 8;
+    if (dg == 0u) continue;
+    float s = F[B + c];
+    if ((m & 1u) != 0u) s += F[X + c - 1u];
+    if ((m & 2u) != 0u) s += F[X + c + 1u];
+    if ((m & 4u) != 0u) s += F[X + c - sy];
+    if ((m & 8u) != 0u) s += F[X + c + sy];
+    if ((m & 16u) != 0u) s += F[X + c - sz];
+    if ((m & 32u) != 0u) s += F[X + c + sz];
+    F[X + c] = s / float(dg);
+  }
+  sync_();
+}
+
+void residual(int l) {
+  uint nx = L(l, 0), ny = L(l, 1), nz = L(l, 2), X = L(l, 3), B = L(l, 4), R = L(l, 5), ST = L(l, 6);
+  uint n = nx * ny * nz, sy = nx, sz = nx * ny;
+  for (uint c = gl_LocalInvocationIndex; c < n; c += 1024u) {
+    uint w = S[ST + c], dg = w & 255u, m = w >> 8;
+    if (dg == 0u) { F[R + c] = 0.0; continue; }
+    float s = float(dg) * F[X + c];
+    if ((m & 1u) != 0u) s -= F[X + c - 1u];
+    if ((m & 2u) != 0u) s -= F[X + c + 1u];
+    if ((m & 4u) != 0u) s -= F[X + c - sy];
+    if ((m & 8u) != 0u) s -= F[X + c + sy];
+    if ((m & 16u) != 0u) s -= F[X + c - sz];
+    if ((m & 32u) != 0u) s -= F[X + c + sz];
+    F[R + c] = F[B + c] - s;
+  }
+  sync_();
+}
+
+void restrict_(int l) {
+  int fx = int(L(l, 0)), fy = int(L(l, 1)), fz = int(L(l, 2));
+  uint FR = L(l, 5), FST = L(l, 6);
+  uint cx = L(l + 1, 0), cy = L(l + 1, 1), cz = L(l + 1, 2), CB = L(l + 1, 4), CST = L(l + 1, 6);
+  uint n = cx * cy * cz;
+  for (uint c = gl_LocalInvocationIndex; c < n; c += 1024u) {
+    int I = int(c % cx), J = int((c / cx) % cy), K = int(c / (cx * cy));
+    if ((S[CST + c] & 255u) == 0u) { F[CB + c] = 0.0; continue; }
+    float s = 0.0;
+    for (int q = 0; q < 8; q++) {
+      int i = 2 * I + (q & 1), j = 2 * J + ((q >> 1) & 1), k = 2 * K + ((q >> 2) & 1);
+      if (i >= fx || j >= fy || k >= fz) continue;
+      uint cf = uint(i + fx * (j + fy * k));
+      if ((S[FST + cf] & 255u) != 0u) s += F[FR + cf];
+    }
+    F[CB + c] = 0.5 * s;
+  }
+  sync_();
+}
+
+void prolong(int l) {
+  uint nx = L(l, 0), ny = L(l, 1), nz = L(l, 2), X = L(l, 3), ST = L(l, 6);
+  uint cx = L(l + 1, 0), cy = L(l + 1, 1), CX = L(l + 1, 3);
+  uint n = nx * ny * nz;
+  for (uint c = gl_LocalInvocationIndex; c < n; c += 1024u) {
+    if ((S[ST + c] & 255u) == 0u) continue;
+    uint i = c % nx, j = (c / nx) % ny, k = c / (nx * ny);
+    F[X + c] += F[CX + (i >> 1) + cx * ((j >> 1) + cy * (k >> 1))];
+  }
+  sync_();
+}
+
+void main() {
+  int lf = pc.n.x, last = pc.n.y, csw = pc.n.z;
+  for (int l = lf; l < last; l++) {
+    zero_x(l);
+    for (int s = 0; s < 2; s++) { rbgs(l, 0); rbgs(l, 1); }
+    residual(l);
+    restrict_(l);
+  }
+  zero_x(last);
+  for (int s = 0; s < csw; s++) { rbgs(last, 0); rbgs(last, 1); }
+  for (int s = 0; s < csw; s++) { rbgs(last, 1); rbgs(last, 0); }
+  for (int l = last - 1; l >= lf; l--) {
+    prolong(l);
+    for (int s = 0; s < 2; s++) { rbgs(l, 1); rbgs(l, 0); }
+  }
+}

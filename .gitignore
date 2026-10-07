@@ -6,3 +6,6 @@ __pycache__/
 *.pyc
 nova_cache/
 *.blend1
+addon/nova_fx/lib/gpu_vk.c
+addon/nova_fx/lib/shaders_spv.h
+addon/nova_fx/lib/nova_params.h
