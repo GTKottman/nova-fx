@@ -5,10 +5,10 @@
 //                    o0 = (density, heat, fuel, -), o1 = (U, V, W, -), f0 = (R^2, dens, heat, fuel),
 //                    f1 = (vel_amt, mode, dx, -), f2 = (ox, oy, oz, -), o2 = (ntx, nty, has_vel, rr tiles)
 //  1 deposit         PTS = (x, y, z, smoke, heat, fuel); tiles hold particles by base cell; trilinear add
+// Tiled: the tiles the points can reach, cells.
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
 #include "common.glsl"
-void main() {
-  ivec3 g = ivec3(gl_GlobalInvocationID);
+void cell(ivec3 g) {
   if (any(greaterThanEqual(g, pc.n.xyz))) return;
   int ntx = int(pc.o2.x), nty = int(pc.o2.y), ntz = (pc.n.z + 7) / 8;
   uint nt = uint(ntx * nty * ntz);
@@ -70,4 +70,9 @@ void main() {
     }
     F[pc.o0.x + c] += sd; F[pc.o0.y + c] += sh; F[pc.o0.z + c] += sf;
   }
+}
+void main() {
+  if (!tiled()) { cell(ivec3(gl_GlobalInvocationID)); return; }
+  Box b = tile_box(cur_tile(), pc.n.xyz);
+  BOX_BEGIN(b) cell(g); BOX_END
 }

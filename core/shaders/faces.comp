@@ -5,15 +5,16 @@
 //  2 clamp |v| <= f0.x             o0 = (U, V, W)
 //  3 zero faces next to solids     o0 = (U, V, W), o2.x = solid offset in S, o2.y = closed floor
 //  4 max |v| partials -> R[o2.z + workgroup]
+//  5 clear tiles that left the pressure region: all nine face arrays and phi
+//    o0 = (U, V, W, phi), o1 = (U0, V0, W0, -), o2 = (U1, V1, W1, -)
+// Tiled: the pressure tiles (op 5: the tiles that left it), faces_union with the pressure-region layer.
+// cu/cv/cw: this index's u/v/w face belongs to the work.
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
 #include "common.glsl"
 shared float red[256];
-void main() {
+float at(ivec3 g, bool cu, bool cv, bool cw) {
   int op = pc.n.w;
-  ivec3 g = ivec3(gl_GlobalInvocationID);
   int nx = pc.n.x, ny = pc.n.y, nz = pc.n.z;
-  bool cu = g.x <= nx && g.y < ny && g.z < nz, cv = g.x < nx && g.y <= ny && g.z < nz,
-       cw = g.x < nx && g.y < ny && g.z <= nz;
   uint iu = uidx(g.x, g.y, g.z), iv = vidx(g.x, g.y, g.z), iw = widx(g.x, g.y, g.z);
   if (op == 0) {
     if (cu) F[pc.o0.x + iu] = F[pc.o1.x + iu];
@@ -51,16 +52,39 @@ void main() {
     if (cu) m = max(m, abs(F[pc.o0.x + iu]));
     if (cv) m = max(m, abs(F[pc.o0.y + iv]));
     if (cw) m = max(m, abs(F[pc.o0.z + iw]));
-    uint l = gl_LocalInvocationIndex;
-    red[l] = m;
-    barrier();
-    for (uint s = 128u; s > 0u; s >>= 1) {
-      if (l < s) red[l] = max(red[l], red[l + s]);
-      barrier();
-    }
-    if (l == 0u) {
-      uvec3 ng = gl_NumWorkGroups, w = gl_WorkGroupID;
-      R[pc.o2.z + w.x + ng.x * (w.y + ng.y * w.z)] = red[0];
-    }
+    return m;
+  } else if (op == 5) {
+    if (cu) { F[pc.o0.x + iu] = 0.0; F[pc.o1.x + iu] = 0.0; F[pc.o2.x + iu] = 0.0; }
+    if (cv) { F[pc.o0.y + iv] = 0.0; F[pc.o1.y + iv] = 0.0; F[pc.o2.y + iv] = 0.0; }
+    if (cw) { F[pc.o0.z + iw] = 0.0; F[pc.o1.z + iw] = 0.0; F[pc.o2.z + iw] = 0.0; }
+    if (all(lessThan(g, pc.n.xyz))) F[pc.o0.w + cidx(g.x, g.y, g.z)] = 0.0;
   }
+  return 0.0;
+}
+void main() {
+  int op = pc.n.w;
+  ivec3 n = pc.n.xyz;
+  float m = 0.0;
+  uint part;
+  if (!tiled()) {
+    ivec3 g = ivec3(gl_GlobalInvocationID);
+    m = at(g, g.x <= n.x && g.y < n.y && g.z < n.z, g.x < n.x && g.y <= n.y && g.z < n.z,
+           g.x < n.x && g.y < n.y && g.z <= n.z);
+    uvec3 ng = gl_NumWorkGroups, w = gl_WorkGroupID;
+    part = w.x + ng.x * (w.y + ng.y * w.z);
+  } else {
+    Box bu, bv, bw;
+    Box b = faces_union(cur_tile(), n, true, bu, bv, bw);
+    BOX_BEGIN(b) m = max(m, at(g, in_box(g, bu), in_box(g, bv), in_box(g, bw))); BOX_END
+    part = gl_WorkGroupID.x;
+  }
+  if (op != 4) return;
+  uint l = gl_LocalInvocationIndex;
+  red[l] = m;
+  barrier();
+  for (uint s = 128u; s > 0u; s >>= 1) {
+    if (l < s) red[l] = max(red[l], red[l + s]);
+    barrier();
+  }
+  if (l == 0u) R[pc.o2.z + part] = red[0];
 }

@@ -156,6 +156,55 @@ def test_gpu_solver_matches_cpu():
     assert off.mean() < 1e-4
 
 
+def test_gpu_sparse_matches_cpu():
+    """Sparse GPU solver (every kernel runs over the active tiles only) vs the sparse CPU solver. The source
+    slides across the domain and everything fades fast behind it, so tiles join the region at the front and
+    leave it at the back: the GPU content scan, incremental stencil uploads and the clearing of tiles that
+    left all run. The pressure solve is converged tightly: at the default tolerance (1e-3) the two devices
+    stop it at slightly different points and velocities differ by ~1e-4 of peak, dense or sparse.
+    Skipped without a Vulkan GPU."""
+    probe = core.Fluid((8, 8, 8), 0.1, (0, 0, 0))
+    if not probe.use_gpu(True):
+        print("gpu sparse: skipped,", core.gpu_name()); probe.free(); return
+    probe.free()
+    def run(gpu, frames):
+        f = core.Fluid((48, 48, 64), 0.05, (-1.2, -1.2, 0))
+        k = 60.0  # fades below the tile threshold within ~4 frames
+        f.set_params(dict(sparse=1, vorticity=0.5, turb_amp=4.0, turb_freq=3.0, max_sub=2, smoke_decay=k, cool=k,
+                          fuel_decay=k, flame_decay=k, cg_tol=1e-6, cg_iter=200))
+        s = core.System(); s.set_fluid(f)
+        if gpu: f.use_gpu(True)
+        m = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, -1.6]], np.float32).ravel()
+        mi = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 1.6]], np.float32).ravel()
+        s.set_colliders([[1, *m, *mi, 0.3, 0, 0, 0, 0, 0]])
+        region = []
+        for fr in range(frames):
+            f.splat([[-0.9 + 0.12 * fr, 0, 0.3]], 0.2, dens=1, heat=1.5, fuel=1, vel=[[0, 0, 1]], vel_amt=0.5, mode=1)
+            s.frame(1 / 24, 1, f)
+            region.append((s.stats(f)["active"], f.active_bbox()))
+        f.sync(True)
+        out = np.stack([f.field(i).copy() for i in range(4)]), f.cell_velocity()
+        s.free(); f.free()
+        return out, region
+    (a, av), _ = run(False, 1)
+    (b, bv), _ = run(True, 1)
+    err = max(np.abs(a - b).max() / np.abs(a).max(), np.abs(av - bv).max() / np.abs(av).max())
+    print(f"gpu sparse: 1 frame, max difference {err*100:.5f}% of peak")
+    assert err < 1e-5  # the kernels compute the same thing
+    (a, av), reg = run(False, 16)
+    (b, bv), reg_gpu = run(True, 16)
+    assert reg == reg_gpu, (reg, reg_gpu)  # the same tiles every frame
+    act, i0 = [r[0] for r in reg], [r[1][0] for r in reg]
+    assert max(act) <= 0.5 and i0[-1] > i0[0], reg  # sparse, and tiles left the region behind the source
+    off = np.abs(a - b) > 0.005 * np.abs(a).max()
+    offv = np.abs(av - bv) > 0.005 * np.abs(av).max()
+    print(f"gpu sparse: 16 frames, active tiles {min(act)*100:.0f}-{max(act)*100:.0f}%, region start x {i0[0]} -> {i0[-1]}, "
+          f"{off.mean()*100:.4f}% of scalar and {offv.mean()*100:.4f}% of velocity cells differ by more than 0.5% of peak")
+    assert off.mean() < 1e-4 and offv.mean() < 1e-4
+    (c, cv), _ = run(True, 16)
+    assert np.array_equal(b, c) and np.array_equal(bv, cv)  # run to run: bit-identical
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and (len(sys.argv) < 2 or name in sys.argv[1:]):

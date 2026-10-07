@@ -3,10 +3,10 @@
 // o0 = (U, V, W, scalars[4 consecutive]), o1.x = tmp (hat[4], mn[4], mx[4] consecutive), f0.x = dt/dx
 // op 0: back-trace + hat/min/max, op 1: forward-trace correction, written back in place,
 // op 2: no correction (MacCormack off): copy hat back.
+// Tiled: the advection tiles, cells.
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
 #include "common.glsl"
-void main() {
-  ivec3 g = ivec3(gl_GlobalInvocationID);
+void cell(ivec3 g) {
   if (any(greaterThanEqual(g, pc.n.xyz))) return;
   uint nc = uint(pc.n.x * pc.n.y * pc.n.z), c = cidx(g.x, g.y, g.z);
   vec3 p = vec3(g) + 0.5;
@@ -32,4 +32,9 @@ void main() {
       F[SC + q * nc + c] = max(val, 0.0);
     }
   }
+}
+void main() {
+  if (!tiled()) { cell(ivec3(gl_GlobalInvocationID)); return; }
+  Box b = tile_box(cur_tile(), pc.n.xyz);
+  BOX_BEGIN(b) cell(g); BOX_END
 }

@@ -66,6 +66,12 @@ WEAK void gpuf_download(GpuFluid *g, int which, float *dst);
 WEAK void gpuf_download_velocity(GpuFluid *g, float *u, float *v, float *w);
 WEAK int gpuf_active_bbox(GpuFluid *g, int *b);
 WEAK void gpuf_stats(GpuFluid *g, int *iters, float *res, double *ms);
+WEAK void gpuf_set_tiles(GpuFluid *g, int sparse, const uint8_t *t_adv, const uint8_t *t_prs, const int *adv,
+                         int n_adv, const int *prs, int n_prs, const int *leave, int n_leave, int *const *blist,
+                         const int *nbl);
+WEAK void gpuf_stencil_blocks(GpuFluid *g, int *const *slist, const int *nsl, uint8_t *const *diag,
+                              uint8_t *const *nb, const uint8_t *solid);
+WEAK void gpuf_tile_max(GpuFluid *g, const int *tiles, int n, float *out);
 
 #define E_K(n, d) KP_##n,
 #define E_S(n, d) SP_##n,
@@ -346,9 +352,11 @@ typedef struct NvFluid {
   uint8_t *t_dirty; /* tiles written by sources since the last scan */
   uint8_t *t_force; /* tiles whose solid cells changed (re-type them) */
   int *tl_adv, *tl_prs, n_adv, n_prs, *tl_chg, n_chg, *cand;
+  float *t_max;                /* GPU: per-candidate content maxima read back for the tile scan */
   int vox_pending, vox_box[6]; /* cells to re-voxelize against the colliders */
   GpuFluid *gpu;               /* non-NULL: the solver runs on the GPU, CPU arrays are download targets */
   int hier_ver, gpu_hier_ver;
+  int hier_inc; /* the last hierarchy update was incremental (only the blocks in each level's slist changed) */
 } NvFluid;
 
 #define TS 8
@@ -429,6 +437,7 @@ API NvFluid *nv_fluid_new(int nx, int ny, int nz, float dx, float ox, float oy, 
   f->tl_adv = (int *)malloc(sizeof(int) * f->nt); f->tl_prs = (int *)malloc(sizeof(int) * f->nt);
   f->tl_chg = (int *)malloc(sizeof(int) * f->nt); f->cand = (int *)malloc(sizeof(int) * f->nt);
   f->t_dirty = balloc(f->nt); f->t_force = balloc(f->nt);
+  f->t_max = falloc(f->nt);
   f->ctype = balloc(f->nc);
   f->lev[0].type = f->ctype;
   return f;
@@ -444,7 +453,7 @@ API void nv_fluid_free(NvFluid *f) {
   free(f->solid);
   free(f->t_cont); free(f->t_adv); free(f->t_prs); free(f->t_prev); free(f->tl_adv); free(f->tl_prs);
   free(f->ctype);
-  free(f->tl_chg); free(f->cand); free(f->t_dirty); free(f->t_force);
+  free(f->tl_chg); free(f->cand); free(f->t_dirty); free(f->t_force); free(f->t_max);
   for (int l = 0; l < f->nlev; l++) {
     Lev *L = &f->lev[l];
     free(L->diag); free(L->nb); free(L->r);
@@ -686,16 +695,19 @@ static inline void tile_mark_range(NvFluid *f, uint8_t *m, int i0, int i1, int j
  * source wrote to, so only those are scanned: the cost follows the effect, not the domain. */
 static void update_tiles(NvFluid *f) {
   const float eps = 1e-4f;
-  int full = f->fp[FP_sparse] < 0.5f || f->gpu; /* the GPU solver is dense */
+  int full = f->fp[FP_sparse] < 0.5f;
   int nc = 0;
   for (int t = 0; t < f->nt; t++) {
     if (full || f->t_adv[t] || f->t_dirty[t]) f->cand[nc++] = t;
     else f->t_cont[t] = 0;
   }
+  int gpu_scan = f->gpu && !full; /* the fields live on the GPU: scan the candidates there */
+  if (gpu_scan) gpuf_tile_max(f->gpu, f->cand, nc, f->t_max);
 #pragma omp parallel for schedule(dynamic, 4)
   for (int q = 0; q < nc; q++) {
     int t = f->cand[q];
     if (full) { f->t_cont[t] = 1; continue; }
+    if (gpu_scan) { f->t_cont[t] = f->t_max[q] > eps; continue; }
     int b[6], any = 0;
     tile_box(f, t, 0, 0, 0, b);
     for (int k = b[4]; k < b[5] && !any; k++)
@@ -750,6 +762,7 @@ static void update_tiles(NvFluid *f) {
           if (f->ctype[c]) f->phi[c] = 0.f;
         }
     hierarchy_full(f);
+    f->hier_inc = 0;
     f->solid_dirty = 0;
     active_blocks(f);
   } else if (f->n_chg) {
@@ -767,12 +780,13 @@ static void update_tiles(NvFluid *f) {
           }
     }
     hierarchy_incremental(f);
+    f->hier_inc = 1;
     active_blocks(f);
   }
 }
 
 API int nv_fluid_active_bbox(NvFluid *f, int *b) {
-  if (f->gpu) return gpuf_active_bbox(f->gpu, b);
+  if (f->gpu && f->fp[FP_sparse] < 0.5f) return gpuf_active_bbox(f->gpu, b); /* dense: no tile tracking */
   /* cell bounds [i0,i1) [j0,j1) [k0,k1) of everything that can hold smoke/heat/fuel/flame */
   int lo[3] = {1 << 30, 1 << 30, 1 << 30}, hi[3] = {-1, -1, -1};
   for (int t = 0; t < f->nt; t++) {
@@ -1617,7 +1631,7 @@ static void combust(NvFluid *f, float dt) {
 
 /* fastest face; faces outside the pressure tiles are zero by construction, so only those count */
 static float max_speed(NvFluid *f) {
-  if (f->gpu) return gpuf_max_speed(f->gpu);
+  if (f->gpu) return f->fp[FP_sparse] > 0.5f && !f->n_prs ? 0.f : gpuf_max_speed(f->gpu);
   float m = 0.f;
   float *arr[3] = {f->u, f->v, f->w};
 #pragma omp parallel for reduction(max : m) schedule(dynamic, 1)
@@ -1700,12 +1714,27 @@ static void swapp(float **a, float **b) {
 static void fluid_substep(NvFluid *f, float dt) {
   update_tiles(f);
   if (f->gpu) {
+    int sparse = f->fp[FP_sparse] > 0.5f;
+    uint8_t *diag[16], *nb[16];
+    int *blist[16], nbl[16], *slist[16], nsl[16];
+    for (int l = 0; l < f->nlev; l++) {
+      diag[l] = f->lev[l].diag; nb[l] = f->lev[l].nb;
+      blist[l] = f->lev[l].blist; nbl[l] = f->lev[l].nbl;
+      slist[l] = f->lev[l].slist; nsl[l] = f->lev[l].nsl;
+    }
     if (f->gpu_hier_ver != f->hier_ver) {
-      uint8_t *diag[16], *nb[16];
-      for (int l = 0; l < f->nlev; l++) { diag[l] = f->lev[l].diag; nb[l] = f->lev[l].nb; }
-      gpuf_set_stencils(f->gpu, f->solid, diag, nb, PERM);
+      /* one incremental update since the last upload: send only the blocks it re-stencilled */
+      if (f->hier_inc && f->gpu_hier_ver == f->hier_ver - 1) gpuf_stencil_blocks(f->gpu, slist, nsl, diag, nb, f->solid);
+      else gpuf_set_stencils(f->gpu, f->solid, diag, nb, PERM);
       f->gpu_hier_ver = f->hier_ver;
     }
+    int n_leave = 0; /* tiles that left the pressure region (zero_tile_faces on the CPU) */
+    for (int q = 0; q < f->n_chg; q++) {
+      int t = f->tl_chg[q];
+      if (f->t_prev[t] && !f->t_prs[t]) f->cand[n_leave++] = t;
+    }
+    gpuf_set_tiles(f->gpu, sparse, f->t_adv, f->t_prs, f->tl_adv, f->n_adv, f->tl_prs, f->n_prs, f->cand, n_leave,
+                   blist, nbl);
     gpuf_substep(f->gpu, f->fp, dt, f->time);
     f->time += dt;
     return;
@@ -1768,10 +1797,6 @@ API void nv_fluid_step(NvFluid *f, float dt) {
  * Smooth kernel w = (1 - r^2/R^2)^2. vel (3n, may be NULL) pulls face velocity toward it. */
 API void nv_fluid_splat(NvFluid *f, int n, const float *pos, float radius, float dens, float heat, float fuel,
                         const float *vel, float vel_amt, int mode) {
-  if (f->gpu) {
-    gpuf_splat(f->gpu, n, pos, radius, dens, heat, fuel, vel, vel_amt, mode);
-    return;
-  }
   int nx = f->nx, ny = f->ny, nz = f->nz;
   float dx = f->dx, R = fmaxf(radius, 0.75f * dx), R2 = R * R, inv = 1.f / dx;
   int rr = (int)ceilf(R * inv) + 1;
@@ -1779,6 +1804,10 @@ API void nv_fluid_splat(NvFluid *f, int n, const float *pos, float radius, float
     int ci = (int)floorf((pos[3 * p] - f->o[0]) * inv), cj = (int)floorf((pos[3 * p + 1] - f->o[1]) * inv),
         ck = (int)floorf((pos[3 * p + 2] - f->o[2]) * inv);
     tile_mark_range(f, f->t_dirty, ci - rr, ci + rr, cj - rr, cj + rr, ck - rr, ck + rr);
+  }
+  if (f->gpu) {
+    gpuf_splat(f->gpu, n, pos, radius, dens, heat, fuel, vel, vel_amt, mode);
+    return;
   }
 #pragma omp parallel for schedule(dynamic, 1)
   for (int k = 0; k < nz; k++) {
@@ -1826,12 +1855,17 @@ API void nv_fluid_splat(NvFluid *f, int n, const float *pos, float radius, float
  * amt is 3 floats per point: smoke, heat, fuel (already multiplied by dt). */
 static void fluid_deposit(NvFluid *f, int n, const float *pos, const float *amt) {
   if (n <= 0) return;
+  int nx = f->nx, ny = f->ny, nz = f->nz;
+  float inv = 1.f / f->dx;
   if (f->gpu) {
+    for (int p = 0; p < n; p++) {
+      int i = (int)floorf((pos[3 * p] - f->o[0]) * inv - 0.5f), j = (int)floorf((pos[3 * p + 1] - f->o[1]) * inv - 0.5f),
+          k = (int)floorf((pos[3 * p + 2] - f->o[2]) * inv - 0.5f);
+      if (k >= -1 && k < nz) tile_mark_range(f, f->t_dirty, i, i + 1, j, j + 1, k, k + 1);
+    }
     gpuf_deposit(f->gpu, n, pos, amt);
     return;
   }
-  int nx = f->nx, ny = f->ny, nz = f->nz;
-  float inv = 1.f / f->dx;
   int *kb = (int *)malloc(sizeof(int) * n);
   int *cnt = (int *)calloc(nz + 1, sizeof(int));
   int *order = (int *)malloc(sizeof(int) * n);

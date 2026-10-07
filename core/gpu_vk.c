@@ -64,7 +64,8 @@ typedef struct {
   int32_t n[4];
   uint32_t o0[4], o1[4], o2[4];
   float f0[4], f1[4], f2[4];
-} PC; /* 112 bytes, matches common.glsl */
+  uint32_t tl[4]; /* tiled dispatch: tile list offset in S, box, tile flags offset in S, on */
+} PC; /* 128 bytes (the Vulkan minimum for push constants), matches common.glsl */
 
 static struct {
   int ready, tried;
@@ -303,6 +304,11 @@ typedef struct GpuFluid {
   int last_iters;
   float last_res;
   double ms;
+  /* sparse: kernels run over the tiles nova_core.c tracks (lists and flags live in S) */
+  int sparse, n_adv, n_prs, nbl[MAXLEV], nbk[MAXLEV];
+  uint32_t tl_flags, tl_adv, tl_prs, tl_leave, tl_cand, tl_splat, tl_blk[MAXLEV];
+  uint8_t *up_adv, *up_prs; /* flags as last uploaded */
+  size_t stage_used;        /* bytes of the staging buffer queued in the open submit */
   VkQueryPool qp, qbusy;
   double busy_ms, wait_ms; /* GPU executing vs host round trips, accumulated */
   int nts;              /* timestamps written this substep */
@@ -332,6 +338,7 @@ static long g_syncs;
 API long nv_gpu_sync_count(void) { return g_syncs; }
 
 static void flush(GpuFluid *g) {
+  g->stage_used = 0; /* nothing queued uses the staging buffer once this returns */
   if (!g->recording) return;
   g_syncs++;
   if (g->qbusy) vkCmdWriteTimestamp_(g->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g->qbusy, 1);
@@ -385,6 +392,27 @@ static void disp(GpuFluid *g, int sh, const PC *pc, uint32_t gx, uint32_t gy, ui
 
 static uint32_t cdiv(int a, int b) { return (uint32_t)((a + b - 1) / b); }
 
+/* One workgroup per tile of the list at S[list] (the kernels' tiled mode); an empty list does nothing. */
+static void disp_tiles(GpuFluid *g, int sh, PC *pc, uint32_t list, int n) {
+  if (n <= 0) return;
+  pc->tl[0] = list; pc->tl[1] = 0; pc->tl[2] = g->tl_flags; pc->tl[3] = 1;
+  disp(g, sh, pc, (uint32_t)n, 1, 1);
+}
+
+/* The whole grid (dense), or the advection / pressure tiles, or a multigrid level's active blocks (sparse). */
+static void run_adv(GpuFluid *g, int sh, PC *pc, uint32_t gx, uint32_t gy, uint32_t gz) {
+  if (g->sparse) disp_tiles(g, sh, pc, g->tl_adv, g->n_adv);
+  else disp(g, sh, pc, gx, gy, gz);
+}
+static void run_prs(GpuFluid *g, int sh, PC *pc, uint32_t gx, uint32_t gy, uint32_t gz) {
+  if (g->sparse) disp_tiles(g, sh, pc, g->tl_prs, g->n_prs);
+  else disp(g, sh, pc, gx, gy, gz);
+}
+static void run_lev(GpuFluid *g, int l, int sh, PC *pc, uint32_t gx, uint32_t gy, uint32_t gz) {
+  if (g->sparse) disp_tiles(g, sh, pc, g->tl_blk[l], g->nbl[l]);
+  else disp(g, sh, pc, gx, gy, gz);
+}
+
 static void pc_init(PC *p, int nx, int ny, int nz, int op) {
   memset(p, 0, sizeof *p);
   p->n[0] = nx; p->n[1] = ny; p->n[2] = nz; p->n[3] = op;
@@ -424,6 +452,27 @@ static int upload(GpuFluid *g, Buf *dst, VkDeviceSize off, const void *src, size
     done += chunk;
   }
   return 0;
+}
+
+/* Queue a small upload in the open submit. Staging space is handed out in order and reused only after
+ * that submit completes, so several uploads and the dispatches reading them go in one submit. */
+static void push(GpuFluid *g, Buf *dst, VkDeviceSize off, const void *src, size_t bytes) {
+  if (!bytes) return;
+  if (bytes > g->stage.size) {
+    upload(g, dst, off, src, bytes);
+    return;
+  }
+  size_t at = (g->stage_used + 15) & ~(size_t)15;
+  if (at + bytes > g->stage.size) {
+    flush(g);
+    at = 0;
+  }
+  memcpy((char *)g->stage.map + at, src, bytes);
+  begin(g);
+  VkBufferCopy cp = {at, off, bytes};
+  vkCmdCopyBuffer_(g->cmd, g->stage.buf, dst->buf, 1, &cp);
+  barrier(g);
+  g->stage_used = at + bytes;
 }
 
 static int download(GpuFluid *g, const Buf *src, VkDeviceSize off, void *dst, size_t bytes) {
@@ -516,6 +565,19 @@ HIDDEN GpuFluid *gpuf_new(int nx, int ny, int nz, float dx, const float *o, int 
     soff += (size_t)g->lx[l] * g->ly[l] * g->lz[l];
   }
   g->perm_off = (uint32_t)soff; soff += 512;
+  g->tl_flags = (uint32_t)soff; soff += (size_t)g->nt / 4 + 1;
+  g->tl_adv = (uint32_t)soff; soff += (size_t)g->nt;
+  g->tl_prs = (uint32_t)soff; soff += (size_t)g->nt;
+  g->tl_leave = (uint32_t)soff; soff += (size_t)g->nt;
+  g->tl_cand = (uint32_t)soff; soff += (size_t)g->nt;
+  g->tl_splat = (uint32_t)soff; soff += (size_t)g->nt;
+  for (int l = 0; l < nlev; l++) {
+    g->nbk[l] = (int)(cdiv(g->lx[l], 8) * cdiv(g->ly[l], 8) * cdiv(g->lz[l], 8));
+    g->tl_blk[l] = (uint32_t)soff;
+    soff += (size_t)g->nbk[l];
+  }
+  g->up_adv = (uint8_t *)calloc((size_t)g->nt, 1);
+  g->up_prs = (uint8_t *)calloc((size_t)g->nt, 1);
   size_t parts = cdiv((int)g->nc, 256) + cdiv(nx + 1, 8) * cdiv(ny + 1, 8) * cdiv(nz + 1, 4) + (size_t)g->nt + 64;
   g->r_npart = (uint32_t)parts;
   g->r_part = 128;
@@ -579,6 +641,8 @@ HIDDEN void gpuf_free(GpuFluid *g) {
   if (g->ds) vkFreeDescriptorSets_(G.dev, G.dpool, 1, &g->ds);
   if (g->qp) vkDestroyQueryPool_(G.dev, g->qp, NULL);
   if (g->qbusy) vkDestroyQueryPool_(G.dev, g->qbusy, NULL);
+  free(g->up_adv);
+  free(g->up_prs);
   free(g);
 }
 
@@ -633,13 +697,18 @@ static void vcycle(GpuFluid *g, int l) {
   pc_init(&p, nx, ny, nz, 1);
   p.o0[0] = g->lvx[l]; p.o0[1] = g->lvb[l]; p.o0[2] = g->lvr[l]; p.o0[3] = g->lst[l];
   if (l == g->nlev - 1) { /* coarsest level: smooth to convergence, symmetric order (as on the CPU) */
+    if (nx * ny * nz <= 256) { /* one workgroup, x in shared memory: 1 dispatch instead of 49 */
+      p.n[3] = 7;
+      disp(g, SH_mg, &p, 1, 1, 1);
+      return;
+    }
     p.n[3] = 0;
-    disp(g, SH_mg, &p, gx, gy, gz);
+    run_lev(g, l, SH_mg, &p, gx, gy, gz);
     p.n[3] = 1;
     for (int s = 0; s < 12; s++)
-      for (int c = 0; c < 2; c++) { p.o1[0] = (uint32_t)c; disp(g, SH_mg, &p, gx, gy, gz); }
+      for (int c = 0; c < 2; c++) { p.o1[0] = (uint32_t)c; run_lev(g, l, SH_mg, &p, gx, gy, gz); }
     for (int s = 0; s < 12; s++)
-      for (int c = 1; c >= 0; c--) { p.o1[0] = (uint32_t)c; disp(g, SH_mg, &p, gx, gy, gz); }
+      for (int c = 1; c >= 0; c--) { p.o1[0] = (uint32_t)c; run_lev(g, l, SH_mg, &p, gx, gy, gz); }
     return;
   }
   /* pre-smooth from x = 0: the first red sweep needs no neighbours, so no zeroing pass */
@@ -647,7 +716,7 @@ static void vcycle(GpuFluid *g, int l) {
     for (int c = 0; c < 2; c++) {
       p.o1[0] = (uint32_t)c;
       p.o1[1] = (s == 0 && c == 0) ? 1u : 0u;
-      disp(g, SH_mg, &p, gx, gy, gz);
+      run_lev(g, l, SH_mg, &p, gx, gy, gz);
     }
   p.o1[1] = 0;
   int cx = g->lx[l + 1], cy = g->ly[l + 1], cz = g->lz[l + 1];
@@ -655,25 +724,26 @@ static void vcycle(GpuFluid *g, int l) {
   pc_init(&q, cx, cy, cz, 5);
   q.o0[0] = g->lvx[l]; q.o0[1] = g->lst[l]; q.o0[2] = g->lvb[l + 1]; q.o0[3] = g->lst[l + 1];
   q.o1[0] = (uint32_t)nx; q.o1[1] = (uint32_t)ny; q.o1[2] = (uint32_t)nz; q.o1[3] = g->lvb[l];
-  disp(g, SH_mg, &q, cdiv(cx, 8), cdiv(cy, 8), cdiv(cz, 4));
+  run_lev(g, l + 1, SH_mg, &q, cdiv(cx, 8), cdiv(cy, 8), cdiv(cz, 4));
   vcycle(g, l + 1);
   PC r;
   pc_init(&r, nx, ny, nz, 4);
   r.o0[0] = g->lvx[l]; r.o0[3] = g->lst[l];
   r.o1[0] = g->lvx[l + 1]; r.o1[1] = (uint32_t)cx; r.o1[2] = (uint32_t)cy;
-  disp(g, SH_mg, &r, gx, gy, gz);
+  run_lev(g, l, SH_mg, &r, gx, gy, gz);
   for (int s = 0; s < 2; s++)
-    for (int c = 1; c >= 0; c--) { p.o1[0] = (uint32_t)c; disp(g, SH_mg, &p, gx, gy, gz); }
+    for (int c = 1; c >= 0; c--) { p.o1[0] = (uint32_t)c; run_lev(g, l, SH_mg, &p, gx, gy, gz); }
 }
 
 /* MGPCG on level 0: solve A phi = cb. CG scalars stay on the GPU; the host syncs once per batch. */
 static void solve(GpuFluid *g, const float *fp) {
-  uint32_t n = (uint32_t)g->nc, ng = cdiv((int)n, 256);
+  /* partials: one per 256 cells (dense) or per pressure tile (sparse) */
+  uint32_t n = (uint32_t)g->nc, ng = g->sparse ? (uint32_t)g->n_prs : cdiv((int)n, 256);
   PC p;
   pc_init(&p, (int)n, g->nx, g->ny, 4);
   p.o0[0] = g->phi; p.o0[1] = g->cb; p.o0[2] = g->cr; p.o0[3] = g->lst[0];
   p.o2[0] = g->r_part; p.o2[1] = g->r_part2;
-  disp(g, SH_cg, &p, ng, 1, 1);
+  run_prs(g, SH_cg, &p, ng, 1, 1);
   reduce(g, g->r_part, ng, R_RMAX0, 1);
   reduce(g, g->r_part2, ng, R_BMAX, 1);
   const float *R = fetch(g, 0, 128);
@@ -684,7 +754,7 @@ static void solve(GpuFluid *g, const float *fp) {
     PC z;
     pc_init(&z, g->nx, g->ny, g->nz, 0);
     z.o0[0] = g->phi; z.o0[3] = g->lst[0];
-    disp(g, SH_mg, &z, cdiv(g->nx, 8), cdiv(g->ny, 8), cdiv(g->nz, 4));
+    run_lev(g, 0, SH_mg, &z, cdiv(g->nx, 8), cdiv(g->ny, 8), cdiv(g->nz, 4));
     return;
   }
   float tol = fp[FP_cg_tol] * bmax;
@@ -696,34 +766,34 @@ static void solve(GpuFluid *g, const float *fp) {
   vcycle(g, 0);
   /* rz = r.z ; p = z */
   int cur = 0;
-  pc_init(&p, (int)n, 0, 0, 2);
+  pc_init(&p, (int)n, g->nx, g->ny, 2);
   p.o0[0] = g->cr; p.o0[1] = g->cz; p.o2[0] = g->r_part;
-  disp(g, SH_cg, &p, ng, 1, 1);
+  run_prs(g, SH_cg, &p, ng, 1, 1);
   reduce(g, g->r_part, ng, R_RZ + cur, 0);
-  pc_init(&p, (int)n, 0, 0, 3);
+  pc_init(&p, (int)n, g->nx, g->ny, 3);
   p.o0[0] = g->cp; p.o0[1] = g->cz; p.o1[1] = R_ZERO; p.o1[2] = R_ONE;
-  disp(g, SH_cg, &p, ng, 1, 1);
+  run_prs(g, SH_cg, &p, ng, 1, 1);
   int it = 0, done = 0;
   while (!done && it < maxit) {
     int batch = maxit - it < MAXIT_BATCH ? maxit - it : MAXIT_BATCH;
     for (int b = 0; b < batch; b++) {
       pc_init(&p, (int)n, g->nx, g->ny, 0); /* q = A p */
       p.o0[0] = g->cp; p.o0[1] = g->cq; p.o0[3] = g->lst[0]; p.o2[0] = g->r_part;
-      disp(g, SH_cg, &p, ng, 1, 1);
+      run_prs(g, SH_cg, &p, ng, 1, 1);
       reduce(g, g->r_part, ng, R_PQ, 0);
-      pc_init(&p, (int)n, 0, 0, 1); /* x += a p, r -= a q */
+      pc_init(&p, (int)n, g->nx, g->ny, 1); /* x += a p, r -= a q */
       p.o0[0] = g->phi; p.o0[1] = g->cp; p.o0[2] = g->cr; p.o0[3] = g->cq;
       p.o1[1] = R_RZ + cur; p.o1[2] = R_PQ; p.o2[0] = g->r_part;
-      disp(g, SH_cg, &p, ng, 1, 1);
+      run_prs(g, SH_cg, &p, ng, 1, 1);
       reduce(g, g->r_part, ng, R_RMAXIT + (uint32_t)b, 1);
       vcycle(g, 0);
-      pc_init(&p, (int)n, 0, 0, 2); /* rz' = r.z */
+      pc_init(&p, (int)n, g->nx, g->ny, 2); /* rz' = r.z */
       p.o0[0] = g->cr; p.o0[1] = g->cz; p.o2[0] = g->r_part;
-      disp(g, SH_cg, &p, ng, 1, 1);
+      run_prs(g, SH_cg, &p, ng, 1, 1);
       reduce(g, g->r_part, ng, R_RZ + (1 - cur), 0);
-      pc_init(&p, (int)n, 0, 0, 3); /* p = z + (rz'/rz) p */
+      pc_init(&p, (int)n, g->nx, g->ny, 3); /* p = z + (rz'/rz) p */
       p.o0[0] = g->cp; p.o0[1] = g->cz; p.o1[1] = R_RZ + (1 - cur); p.o1[2] = R_RZ + cur;
-      disp(g, SH_cg, &p, ng, 1, 1);
+      run_prs(g, SH_cg, &p, ng, 1, 1);
       cur = 1 - cur;
     }
     R = fetch(g, 0, 128);
@@ -744,16 +814,16 @@ static void project(GpuFluid *g, uint32_t U, uint32_t V, uint32_t W, const float
   PC p;
   pc_init(&p, nx, ny, nz, 3); /* zero faces at solids */
   p.o0[0] = U; p.o0[1] = V; p.o0[2] = W; p.o2[0] = g->solid_off; p.o2[1] = cf;
-  disp(g, SH_faces, &p, fx, fy, fz);
+  run_prs(g, SH_faces, &p, fx, fy, fz);
   pc_init(&p, nx, ny, nz, 0); /* rhs */
   p.o0[0] = U; p.o0[1] = V; p.o0[2] = W; p.o0[3] = g->cb; p.o1[0] = g->expn; p.o2[0] = g->lst[0];
   p.f0[0] = g->dx;
-  disp(g, SH_project, &p, cdiv(nx, 8), cdiv(ny, 8), cdiv(nz, 4));
+  run_prs(g, SH_project, &p, cdiv(nx, 8), cdiv(ny, 8), cdiv(nz, 4));
   solve(g, fp);
   pc_init(&p, nx, ny, nz, 1); /* subtract grad phi */
   p.o0[0] = U; p.o0[1] = V; p.o0[2] = W; p.o0[3] = g->phi; p.o2[0] = g->solid_off; p.o2[1] = cf;
   p.f0[0] = 1.f / g->dx;
-  disp(g, SH_project, &p, fx, fy, fz);
+  run_prs(g, SH_project, &p, fx, fy, fz);
 }
 
 static void advect_velocity(GpuFluid *g, uint32_t su, uint32_t sv, uint32_t sw, uint32_t U, uint32_t V, uint32_t W,
@@ -766,10 +836,10 @@ static void advect_velocity(GpuFluid *g, uint32_t su, uint32_t sv, uint32_t sw, 
     p.o0[0] = U; p.o0[1] = V; p.o0[2] = W; p.o0[3] = src[comp];
     p.o1[0] = dst[comp]; p.o1[1] = g->fhat; p.o1[2] = g->fmn; p.o1[3] = g->fmx;
     p.f0[0] = dt / g->dx;
-    disp(g, SH_adv_face, &p, cdiv(sx, 8), cdiv(sy, 8), cdiv(sz, 4));
+    run_prs(g, SH_adv_face, &p, cdiv(sx, 8), cdiv(sy, 8), cdiv(sz, 4));
     if (mc) {
       p.n[3] = 1 | (comp << 4);
-      disp(g, SH_adv_face, &p, cdiv(sx, 8), cdiv(sy, 8), cdiv(sz, 4));
+      run_adv(g, SH_adv_face, &p, cdiv(sx, 8), cdiv(sy, 8), cdiv(sz, 4));
     }
   }
 }
@@ -781,13 +851,13 @@ static void add_forces(GpuFluid *g, uint32_t U, uint32_t V, uint32_t W, float dt
   pc_init(&p, nx, ny, nz, 0); /* buoyancy on w faces */
   p.o0[0] = U; p.o0[1] = V; p.o0[2] = W; p.o0[3] = g->sc; p.o1[0] = g->sc + (uint32_t)g->nc;
   p.f0[0] = dt; p.f0[1] = fp[FP_buoy_heat]; p.f0[2] = fp[FP_buoy_smoke];
-  disp(g, SH_forces, &p, gx, gy, cdiv(nz + 1, 4));
+  run_adv(g, SH_forces, &p, gx, gy, cdiv(nz + 1, 4));
   float eps = fp[FP_vorticity], tamp = fp[FP_turb_amp];
   if (eps > 0.f || tamp > 0.f) {
     pc_init(&p, nx, ny, nz, 1);
     p.o0[0] = U; p.o0[1] = V; p.o0[2] = W; p.o1[0] = g->tmp;
     p.f0[1] = 0.5f / g->dx;
-    disp(g, SH_forces, &p, gx, gy, gz);
+    run_prs(g, SH_forces, &p, gx, gy, gz);
     pc_init(&p, nx, ny, nz, 2);
     p.o0[0] = U; p.o0[1] = V; p.o0[2] = W; /* local speed limits the noise push */
     p.o0[3] = g->sc;
@@ -796,11 +866,11 @@ static void add_forces(GpuFluid *g, uint32_t U, uint32_t V, uint32_t W, float dt
     p.f0[0] = eps * g->dx; p.f0[1] = 0.5f / g->dx; p.f0[2] = tamp; p.f0[3] = fp[FP_turb_freq];
     p.f1[0] = (float)time * fp[FP_turb_speed]; p.f1[1] = g->dx; p.f1[2] = g->o[0]; p.f1[3] = g->o[1];
     p.f2[0] = g->o[2];
-    disp(g, SH_forces, &p, gx, gy, gz);
+    run_prs(g, SH_forces, &p, gx, gy, gz);
     pc_init(&p, nx, ny, nz, 3);
     p.o0[0] = U; p.o0[1] = V; p.o0[2] = W; p.o1[0] = g->tmp;
     p.f0[0] = dt;
-    disp(g, SH_forces, &p, gx, gy, gz);
+    run_adv(g, SH_forces, &p, gx, gy, gz);
   }
   float wd = fp[FP_wind_drag], vd = fp[FP_vel_decay];
   if (wd > 0.f || vd > 0.f) {
@@ -808,7 +878,7 @@ static void add_forces(GpuFluid *g, uint32_t U, uint32_t V, uint32_t W, float dt
     p.o0[0] = U; p.o0[1] = V; p.o0[2] = W;
     p.f0[0] = 1.f - expf(-wd * dt); p.f0[1] = expf(-vd * dt);
     p.f1[0] = fp[FP_wind_x]; p.f1[1] = fp[FP_wind_y]; p.f1[2] = fp[FP_wind_z];
-    disp(g, SH_forces, &p, cdiv(nx + 1, 8), cdiv(ny + 1, 8), cdiv(nz + 1, 4));
+    run_prs(g, SH_forces, &p, cdiv(nx + 1, 8), cdiv(ny + 1, 8), cdiv(nz + 1, 4));
   }
 }
 
@@ -819,7 +889,7 @@ static void faces_op(GpuFluid *g, int op, uint32_t dU, uint32_t dV, uint32_t dW,
   p.o0[0] = dU; p.o0[1] = dV; p.o0[2] = dW; p.o1[0] = sU; p.o1[1] = sV; p.o1[2] = sW;
   p.o2[0] = g->lst[0];
   p.f0[0] = f;
-  disp(g, SH_faces, &p, cdiv(g->nx + 1, 8), cdiv(g->ny + 1, 8), cdiv(g->nz + 1, 4));
+  run_prs(g, SH_faces, &p, cdiv(g->nx + 1, 8), cdiv(g->ny + 1, 8), cdiv(g->nz + 1, 4));
 }
 
 HIDDEN void gpuf_substep(GpuFluid *g, const float *fp, float dt, double time) {
@@ -837,9 +907,9 @@ HIDDEN void gpuf_substep(GpuFluid *g, const float *fp, float dt, double time) {
   pc_init(&p, nx, ny, nz, 0);
   p.o0[0] = g->u; p.o0[1] = g->v; p.o0[2] = g->w; p.o0[3] = g->sc; p.o1[0] = g->tmp;
   p.f0[0] = dt / g->dx;
-  disp(g, SH_adv_scalars, &p, cdiv(nx, 8), cdiv(ny, 8), cdiv(nz, 4));
+  run_adv(g, SH_adv_scalars, &p, cdiv(nx, 8), cdiv(ny, 8), cdiv(nz, 4));
   p.n[3] = mc ? 1 : 2;
-  disp(g, SH_adv_scalars, &p, cdiv(nx, 8), cdiv(ny, 8), cdiv(nz, 4));
+  run_adv(g, SH_adv_scalars, &p, cdiv(nx, 8), cdiv(ny, 8), cdiv(nz, 4));
   /* combustion */
   ts(g, PH_COMBUST);
   pc_init(&p, nx, ny, nz, 0);
@@ -849,7 +919,7 @@ HIDDEN void gpuf_substep(GpuFluid *g, const float *fp, float dt, double time) {
   p.f1[0] = fp[FP_expansion]; p.f1[1] = expf(-fp[FP_cool] * dt); p.f1[2] = fp[FP_cool_rad];
   p.f1[3] = expf(-fp[FP_smoke_decay] * dt);
   p.f2[0] = expf(-fp[FP_fuel_decay] * dt); p.f2[1] = expf(-fp[FP_flame_decay] * dt); p.f2[2] = dt;
-  disp(g, SH_combust, &p, cdiv((int)g->nc, 256), 1, 1);
+  run_adv(g, SH_combust, &p, cdiv((int)g->nc, 256), 1, 1);
   /* velocity */
   if (fp[FP_reflect] > 0.5f) {
     ts(g, PH_ADV_VEL);
@@ -902,17 +972,20 @@ API void nv_gpu_phases(void *fluid_gpu, double *out) {
 }
 
 HIDDEN float gpuf_max_speed(GpuFluid *g) {
+  if (g->sparse && !g->n_prs) return 0.f; /* faces outside the pressure tiles are zero */
   PC p;
   pc_init(&p, g->nx, g->ny, g->nz, 4);
   p.o0[0] = g->u; p.o0[1] = g->v; p.o0[2] = g->w; p.o2[2] = g->r_part;
   uint32_t gx = cdiv(g->nx + 1, 8), gy = cdiv(g->ny + 1, 8), gz = cdiv(g->nz + 1, 4);
-  disp(g, SH_faces, &p, gx, gy, gz);
-  reduce(g, g->r_part, gx * gy * gz, R_MAXV, 1);
+  run_prs(g, SH_faces, &p, gx, gy, gz);
+  reduce(g, g->r_part, g->sparse ? (uint32_t)g->n_prs : gx * gy * gz, R_MAXV, 1);
   return fetch(g, 0, 128)[R_MAXV];
 }
 
-/* Bucket points into the tiles they can reach, upload, run the gather kernel.
- * op 0: emitter splat (stride 6: pos, vel); op 1: deposit (stride 6: pos, smoke, heat, fuel). */
+/* Bucket points into the tiles they can reach and upload them with the list of tiles the gather kernel
+ * writes. op 0: emitter splat (stride 6: pos, vel); op 1: deposit (stride 6: pos, smoke, heat, fuel),
+ * which also writes the high neighbours of a tile (trilinear weights reach one cell up).
+ * Returns the number of tiles to gather into, or -1. */
 static int bucket_upload(GpuFluid *g, int n, const float *pts6, int op, float R) {
   float inv = 1.f / g->dx;
   int rr = (int)ceilf(R * inv) + 1;
@@ -947,6 +1020,20 @@ static int bucket_upload(GpuFluid *g, int n, const float *pts6, int op, float R)
   uint32_t acc = 0;
   for (int t = 0; t < g->nt; t++) { idx[t] = acc; acc += cnt[t]; }
   idx[g->nt] = acc;
+  uint8_t *mark = (uint8_t *)calloc((size_t)g->nt, 1);
+  uint32_t *list = (uint32_t *)malloc(sizeof(uint32_t) * (size_t)g->nt);
+  int nl = 0;
+  for (int t = 0; t < g->nt; t++) {
+    if (!cnt[t]) continue;
+    int tx = t % g->ntx, ty = (t / g->ntx) % g->nty, tz = t / (g->ntx * g->nty), r = op == 1;
+    for (int dz = 0; dz <= r && tz + dz < g->ntz; dz++)
+      for (int dy = 0; dy <= r && ty + dy < g->nty; dy++)
+        for (int dx = 0; dx <= r && tx + dx < g->ntx; dx++) {
+          int u = t + dx + g->ntx * (dy + g->nty * dz);
+          if (!mark[u]) { mark[u] = 1; list[nl++] = (uint32_t)u; }
+        }
+  }
+  free(mark);
   memset(cnt, 0, sizeof(uint32_t) * (size_t)g->nt);
   for (int p = 0; p < n; p++) { /* increasing point order inside each tile, like the CPU loop */
     int *b = rng[p];
@@ -963,24 +1050,16 @@ static int bucket_upload(GpuFluid *g, int n, const float *pts6, int op, float R)
   flush(g);
   if (ensure_points(g, (size_t)(n ? n : 1) * 6 * sizeof(float), nidx * sizeof(uint32_t))) {
     free(idx);
+    free(list);
     return -1;
   }
-  size_t pb = (size_t)n * 6 * sizeof(float), ib = nidx * sizeof(uint32_t);
-  if (pb + ib <= g->stage.size) { /* both in one submit */
-    flush(g);
-    memcpy(g->stage.map, pts6, pb);
-    memcpy((char *)g->stage.map + pb, idx, ib);
-    begin(g);
-    VkBufferCopy c0 = {0, 0, pb}, c1 = {pb, 0, ib};
-    if (pb) vkCmdCopyBuffer_(g->cmd, g->stage.buf, g->P.buf, 1, &c0);
-    vkCmdCopyBuffer_(g->cmd, g->stage.buf, g->PI.buf, 1, &c1);
-    barrier(g); /* the gather dispatch that follows is recorded into the same submit */
-  } else {
-    if (n) upload(g, &g->P, 0, pts6, pb);
-    upload(g, &g->PI, 0, idx, ib);
-  }
+  /* one submit with the gather dispatch that follows, unless the points outgrow the staging buffer */
+  push(g, &g->P, 0, pts6, (size_t)n * 6 * sizeof(float));
+  push(g, &g->PI, 0, idx, nidx * sizeof(uint32_t));
+  push(g, &g->S, (VkDeviceSize)g->tl_splat * sizeof(uint32_t), list, (size_t)nl * sizeof(uint32_t));
   free(idx);
-  return total ? 1 : 0;
+  free(list);
+  return nl;
 }
 
 HIDDEN void gpuf_splat(GpuFluid *g, int n, const float *pos, float radius, float dens, float heat, float fuel,
@@ -994,9 +1073,9 @@ HIDDEN void gpuf_splat(GpuFluid *g, int n, const float *pos, float radius, float
       pts[6 * p + 3 + a] = vel ? vel[3 * p + a] : 0.f;
     }
   }
-  int any = bucket_upload(g, n, pts, 0, R);
+  int nl = bucket_upload(g, n, pts, 0, R);
   free(pts);
-  if (any <= 0) return;
+  if (nl <= 0) return;
   PC p;
   pc_init(&p, g->nx, g->ny, g->nz, 0);
   p.o0[0] = g->sc; p.o0[1] = g->sc + (uint32_t)g->nc; p.o0[2] = g->sc + 2u * (uint32_t)g->nc;
@@ -1005,7 +1084,7 @@ HIDDEN void gpuf_splat(GpuFluid *g, int n, const float *pos, float radius, float
   p.f0[0] = R * R; p.f0[1] = dens; p.f0[2] = heat; p.f0[3] = fuel;
   p.f1[0] = vel_amt; p.f1[1] = (float)mode; p.f1[2] = g->dx; p.f1[3] = vel && vel_amt > 0.f ? 1.f : 0.f;
   p.f2[0] = g->o[0]; p.f2[1] = g->o[1]; p.f2[2] = g->o[2];
-  disp(g, SH_splat, &p, cdiv(g->nx, 8), cdiv(g->ny, 8), cdiv(g->nz, 4));
+  disp_tiles(g, SH_splat, &p, g->tl_splat, nl);
   flush(g);
 }
 
@@ -1017,16 +1096,16 @@ HIDDEN void gpuf_deposit(GpuFluid *g, int n, const float *pos, const float *amt)
       pts[6 * p + a] = pos[3 * p + a];
       pts[6 * p + 3 + a] = amt[3 * p + a];
     }
-  int any = bucket_upload(g, n, pts, 1, 0.f);
+  int nl = bucket_upload(g, n, pts, 1, 0.f);
   free(pts);
-  if (any <= 0) return;
+  if (nl <= 0) return;
   PC p;
   pc_init(&p, g->nx, g->ny, g->nz, 1);
   p.o0[0] = g->sc; p.o0[1] = g->sc + (uint32_t)g->nc; p.o0[2] = g->sc + 2u * (uint32_t)g->nc;
   p.o2[0] = (uint32_t)g->ntx; p.o2[1] = (uint32_t)g->nty;
   p.f1[2] = g->dx;
   p.f2[0] = g->o[0]; p.f2[1] = g->o[1]; p.f2[2] = g->o[2];
-  disp(g, SH_splat, &p, cdiv(g->nx, 8), cdiv(g->ny, 8), cdiv(g->nz, 4));
+  disp_tiles(g, SH_splat, &p, g->tl_splat, nl);
   flush(g);
 }
 
@@ -1044,6 +1123,7 @@ HIDDEN void gpuf_download(GpuFluid *g, int which, float *dst) {
 
 /* all three velocity components in one submit (particles that ride the flow) */
 HIDDEN void gpuf_download_velocity(GpuFluid *g, float *u, float *v, float *w) {
+  flush(g); /* the copies below use the staging buffer from its start */
   size_t bytes = (g->nu + g->nv + g->nw) * sizeof(float);
   if (bytes > g->stage.size) {
     gpuf_download(g, 4, u);
@@ -1085,6 +1165,96 @@ HIDDEN int gpuf_active_bbox(GpuFluid *g, int *b) {
     b[2 * a + 1] = (hi[a] + 1) * 8 < nn[a] ? (hi[a] + 1) * 8 : nn[a];
   }
   return 1;
+}
+
+/* Sparse mode: the tiles nova_core.c tracks. Flags and lists are uploaded only when they change; tiles that
+ * left the pressure region are cleared (faces and phi), which keeps everything outside it zero, as on the
+ * CPU. Dense mode (sparse = 0) runs every kernel over the whole grid. */
+HIDDEN void gpuf_set_tiles(GpuFluid *g, int sparse, const uint8_t *t_adv, const uint8_t *t_prs, const int *adv,
+                           int n_adv, const int *prs, int n_prs, const int *leave, int n_leave,
+                           int *const *blist, const int *nbl) {
+  g->sparse = sparse;
+  if (!sparse) return;
+  size_t nt = (size_t)g->nt, nw = nt / 4 + 1;
+  if (memcmp(t_adv, g->up_adv, nt) || memcmp(t_prs, g->up_prs, nt)) {
+    uint32_t *fl = (uint32_t *)calloc(nw, sizeof(uint32_t));
+    for (size_t t = 0; t < nt; t++)
+      fl[t >> 2] |= (uint32_t)((t_adv[t] ? 1u : 0u) | (t_prs[t] ? 2u : 0u)) << (8u * (t & 3u));
+    push(g, &g->S, (VkDeviceSize)g->tl_flags * 4, fl, nw * 4);
+    free(fl);
+    push(g, &g->S, (VkDeviceSize)g->tl_adv * 4, adv, (size_t)n_adv * 4);
+    push(g, &g->S, (VkDeviceSize)g->tl_prs * 4, prs, (size_t)n_prs * 4);
+    for (int l = 0; l < g->nlev; l++) {
+      push(g, &g->S, (VkDeviceSize)g->tl_blk[l] * 4, blist[l], (size_t)nbl[l] * 4);
+      g->nbl[l] = nbl[l];
+    }
+    memcpy(g->up_adv, t_adv, nt);
+    memcpy(g->up_prs, t_prs, nt);
+    g->n_adv = n_adv;
+    g->n_prs = n_prs;
+  }
+  if (n_leave > 0) {
+    push(g, &g->S, (VkDeviceSize)g->tl_leave * 4, leave, (size_t)n_leave * 4);
+    PC p;
+    pc_init(&p, g->nx, g->ny, g->nz, 5);
+    p.o0[0] = g->u; p.o0[1] = g->v; p.o0[2] = g->w; p.o0[3] = g->phi;
+    p.o1[0] = g->u0; p.o1[1] = g->v0; p.o1[2] = g->w0;
+    p.o2[0] = g->u1; p.o2[1] = g->v1; p.o2[2] = g->w1;
+    disp_tiles(g, SH_faces, &p, g->tl_leave, n_leave);
+  }
+}
+
+/* Upload only the stencil blocks the CPU re-stencilled (hierarchy_incremental): per level, each block id
+ * then its 512 words in block order; level-0 words carry the solid flag in bits 16+. */
+HIDDEN void gpuf_stencil_blocks(GpuFluid *g, int *const *slist, const int *nsl, uint8_t *const *diag,
+                                uint8_t *const *nb, const uint8_t *solid) {
+  size_t total = 0;
+  for (int l = 0; l < g->nlev; l++) total += (size_t)nsl[l];
+  if (!total) return;
+  uint32_t *w = (uint32_t *)malloc(total * 513 * sizeof(uint32_t));
+  uint32_t base[MAXLEV];
+  size_t at = 0;
+  for (int l = 0; l < g->nlev; l++) {
+    base[l] = (uint32_t)at;
+    int nx = g->lx[l], ny = g->ly[l], nz = g->lz[l], bx = (nx + 7) / 8, by = (ny + 7) / 8;
+    for (int q = 0; q < nsl[l]; q++) {
+      int bk = slist[l][q];
+      int ox = bk % bx * 8, oy = bk / bx % by * 8, oz = bk / (bx * by) * 8;
+      w[at++] = (uint32_t)bk;
+      for (int li = 0; li < 512; li++) {
+        int i = ox + (li & 7), j = oy + ((li >> 3) & 7), k = oz + (li >> 6);
+        if (i >= nx || j >= ny || k >= nz) { w[at++] = 0; continue; }
+        size_t c = (size_t)i + (size_t)nx * ((size_t)j + (size_t)ny * k);
+        w[at++] = (uint32_t)diag[l][c] | ((uint32_t)nb[l][c] << 8) | (l == 0 ? (uint32_t)solid[c] << 16 : 0u);
+      }
+    }
+  }
+  if (ensure_points(g, 16, at * sizeof(uint32_t))) {
+    free(w);
+    return;
+  }
+  push(g, &g->PI, 0, w, at * sizeof(uint32_t));
+  free(w);
+  for (int l = 0; l < g->nlev; l++) {
+    if (!nsl[l]) continue;
+    PC p;
+    pc_init(&p, g->lx[l], g->ly[l], g->lz[l], 6);
+    p.o0[3] = g->lst[l];
+    p.o1[0] = base[l]; p.o1[1] = l == 0;
+    p.o2[0] = g->solid_off;
+    disp(g, SH_mg, &p, (uint32_t)nsl[l], 1, 1);
+  }
+}
+
+/* max of density/heat/fuel/flame over each listed tile (one round trip): what the CPU scan finds */
+HIDDEN void gpuf_tile_max(GpuFluid *g, const int *tiles, int n, float *out) {
+  if (n <= 0) return;
+  push(g, &g->S, (VkDeviceSize)g->tl_cand * 4, tiles, (size_t)n * 4);
+  PC p;
+  pc_init(&p, g->nx, g->ny, g->nz, 0);
+  p.o0[0] = g->sc; p.o2[0] = g->r_part;
+  disp_tiles(g, SH_tilemax, &p, g->tl_cand, n);
+  memcpy(out, fetch(g, g->r_part, (uint32_t)n), (size_t)n * sizeof(float));
 }
 
 HIDDEN void gpuf_stats(GpuFluid *g, int *iters, float *res, double *ms) {
