@@ -2,7 +2,7 @@
 
 import bpy
 
-from . import lightning, ops, props, sim, ui
+from . import lightning, music_sync, ops, props, sim, ui
 
 
 class NovaPreferences(bpy.types.AddonPreferences):
@@ -34,10 +34,11 @@ def _apply_threads(prefs):
 
 
 def register():
+    music_sync.register_types()
     props.register()
     lightning.register()
     bpy.utils.register_class(NovaPreferences)
-    for c in ops.CLASSES + ui.CLASSES:
+    for c in ops.CLASSES + music_sync.CLASSES + ui.CLASSES:
         bpy.utils.register_class(c)
     bpy.types.VIEW3D_MT_add.append(ui.menu_add)
     sim.register()
@@ -46,8 +47,9 @@ def register():
 def unregister():
     sim.unregister()
     bpy.types.VIEW3D_MT_add.remove(ui.menu_add)
-    for c in reversed(ops.CLASSES + ui.CLASSES):
+    for c in reversed(ops.CLASSES + music_sync.CLASSES + ui.CLASSES):
         bpy.utils.unregister_class(c)
     bpy.utils.unregister_class(NovaPreferences)
     lightning.unregister()
     props.unregister()
+    music_sync.unregister_types()

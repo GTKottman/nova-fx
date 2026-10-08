@@ -264,6 +264,33 @@ A wide fire that fills ~40% of a 6.1M-cell domain: CPU sparse 862 ms, GPU dense 
 - **Example:** [`examples/lightning_storm.py`](examples/lightning_storm.py) is a storm with three strikes, one
   of them drawn to a lightning rod on a mast.
 
+### Music sync
+Emitters, lightning and any animatable property can follow a song: **Sidebar → Nova FX → Music**.
+- **Song:** an audio file (any format Blender plays), a MIDI file of the same song, or both. *Song Starts*
+  places it on the timeline, and *Play Along* puts the audio in the sequencer so playback has sound.
+- **Audio analysis (`music.py`):** spectral flux per band (log magnitude minus each bin's noise floor,
+  positive differences only), with peak picking against a moving average (Böck et al. 2012) and a minimum
+  gap. The bands are **Bass** (30–150 Hz: kick, bass), **Mids** (150–2500 Hz: snare body, most
+  instruments), **Highs** (5–16 kHz: hats, cymbals) and **Full Mix**. Onsets are compensated for the
+  window's latency and land within ~5 ms of the hit, about a tenth of a frame. A 3-minute song analyzes in
+  about a second.
+- **MIDI:** exact note-ons from a Standard MIDI File (format 0 or 1, every tempo change). Filter by note
+  (`36`, `36-38`, `C2`, `F#2-A2`, with C4 = 60), channel and track (number or part of its name).
+- **Emitters** (*Music* in the emitter panel):
+  - *Burst per Hit*: particles on every hit, scaled by how hard it hits.
+  - *Rate by Loudness*: the emission rate follows the band's loudness, or the held MIDI notes.
+  - *Every / Offset* let several emitters take turns on one part.
+  - **Land on the Hit** emits one lifetime early, with exactly that lifetime, so the death event happens on
+    the beat. Firework shells launch early and burst on the kick (`nv_emit_life` in the core).
+- **Lightning:** *Strike on the Music* grows one bolt per hit, each with its own seed, impact emitter and
+  brightness from the hit. They start up to *Spread* apart. Syncing again replaces them.
+- **Drive Properties:** keyframes any numeric property from the song, as *Loudness* or *Pulse per Hit*
+  with attack and release: `nova.turb_amp`, `nova.fluid.turb_amp`, `nova_emitter.rate`, `data.energy` …
+- *Sync to Music* stores the result in the .blend (hit lists, keyframes, bolts), so simulating and
+  rendering never read the song again.
+- **Example:** [`examples/fireworks_music.py`](examples/fireworks_music.py) puts seven launchers on the
+  kick, snare and hats of a synthesized beat, and writes an mp4 with the sound.
+
 ### Blender side
 - Native **PointCloud** objects with these attributes: `position`, `radius`, `Cd`, `emit`, `velocity`
   (Cycles motion blur), `age`, `id`, `kind`. Usable in your own shaders and Geometry Nodes.
@@ -302,6 +329,8 @@ Same plume, empty domain grown from 64³ to 256³ (old → now):
 python3 tests/test_core.py                                     # core: correctness + speed, ~7 s
 blender -b --factory-startup --python tests/blender_presets.py -- --frames 24
 blender -b --factory-startup --python tests/blender_lightning.py   # bolt controls, target, timeline
+python3 tests/test_music.py                                     # MIDI parsing, onset timing, ~1 s
+blender -b --factory-startup --python tests/blender_music.py       # shells burst on the beat, bolts, drives
 blender -b --factory-startup --python tests/blender_render.py -- FIREWORKS 260 out.png CYCLES 64
 ```
 

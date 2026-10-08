@@ -21,6 +21,7 @@ from bpy.props import BoolProperty, FloatProperty, IntProperty, PointerProperty
 from mathutils import Vector
 
 from . import core
+from .music_sync import NovaMusicTrigger
 
 MAT = "Nova Lightning"
 _BUSY = set()  # bolts being rebuilt (property writes inside a rebuild must not trigger another)
@@ -82,6 +83,9 @@ class NovaLightning(bpy.types.PropertyGroup):
                                update=_animate_cb, description="Peak power of the flash lights")
     impact: PointerProperty(name="Impact Emitter", type=bpy.types.Object,
                             description="Nova emitter moved to the strike point and burst on the strike frame")
+    music: PointerProperty(type=NovaMusicTrigger)
+    music_spread: FloatProperty(name="Spread", default=20.0, min=0, soft_max=500, unit="LENGTH",
+                                description="Music strikes start this far apart (random, around the bolt)")
 
 
 # ------------------------------------------------------------------ growth

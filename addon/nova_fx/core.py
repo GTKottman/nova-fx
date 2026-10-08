@@ -39,6 +39,7 @@ _SIGS = {
                                  C.c_float, _f]),
     "nv_sys_count": (C.c_int, [_vp]),
     "nv_emit": (C.c_int, [_vp, C.c_int, C.c_int, _f, _f, _f]),
+    "nv_emit_life": (C.c_int, [_vp, C.c_int, C.c_int, _f, _f, _f, _f]),
     "nv_sys_step": (None, [_vp, C.c_float]),
     "nv_sys_set_turb_grid": (None, [_vp, C.c_int]),
     "nv_sys_turb_grid_used": (C.c_int, [_vp]),
@@ -278,11 +279,15 @@ class System:
         nz, ny, nx = d.shape
         return lib().nv_sys_set_sdf(self.h, slot, nx, ny, nz, *[float(o) for o in origin], float(dx), fptr(d))
 
-    def emit(self, kind, pos, vel, preage=None):
+    def emit(self, kind, pos, vel, preage=None, life=None):
+        """life: optional exact lifetimes (seconds) instead of the type's random range."""
         pos = np.ascontiguousarray(pos, np.float32).reshape(-1, 3)
         vel = np.ascontiguousarray(vel, np.float32).reshape(-1, 3)
         pa = None if preage is None else np.ascontiguousarray(preage, np.float32)
-        return lib().nv_emit(self.h, int(kind), len(pos), fptr(pos), fptr(vel), fptr(pa))
+        if life is None:
+            return lib().nv_emit(self.h, int(kind), len(pos), fptr(pos), fptr(vel), fptr(pa))
+        lf = np.ascontiguousarray(np.broadcast_to(np.asarray(life, np.float32), (len(pos),)))
+        return lib().nv_emit_life(self.h, int(kind), len(pos), fptr(pos), fptr(vel), fptr(pa), fptr(lf))
 
     def frame(self, dt, substeps, fluid=None):
         lib().nv_frame(self.h, fluid.h if fluid else None, dt, int(substeps))

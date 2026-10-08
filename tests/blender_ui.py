@@ -75,12 +75,36 @@ def s_fireworks():
         bpy.ops.view3d.view_selected()
 def s_fw_shot():
     shot("3_fireworks")
+def s_music():
+    import importlib.util, wave
+    import numpy as np
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location("test_music", os.path.join(here, "test_music.py"))
+    tm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tm)
+    x, rate, _k, _h = tm.drum_loop()
+    wav = os.path.join(OUT, "ui_loop.wav")
+    with wave.open(wav, "wb") as wf:
+        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(rate)
+        wf.writeframes((np.clip(x, -1, 1) * 32767).astype("<i2").tobytes())
+    sc = bpy.context.scene
+    sc.nova_music.audio = wav
+    ob = bpy.data.objects["Launcher Peony"]
+    ob.nova_emitter.music.enabled = True
+    ob.nova_emitter.music.land = True
+    select(bpy.data.objects["Fireworks"])
+    bpy.ops.nova.music_drive_add()
+    bpy.ops.nova.music_sync()
+    select(ob)
+    L("music synced", len(ob.nova_emitter.music.hits), "hits", sc.nova_music.info)
+def s_music_shot():
+    shot("4_music")
 def s_quit():
     L("done")
     log.close()
     bpy.ops.wm.quit_blender()
 
-seq = [setup, s_system, s_emitter, s_emitter_shot, s_fireworks, s_fw_shot, s_quit]
+seq = [setup, s_system, s_emitter, s_emitter_shot, s_fireworks, s_fw_shot, s_music, s_music_shot, s_quit]
 def tick():
     if not seq:
         return None

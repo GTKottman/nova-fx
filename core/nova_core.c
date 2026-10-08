@@ -2369,8 +2369,10 @@ static void init_particle(const NvSys *s, PB *b, int i, int k, const float *pos,
   b->gen[i] = (uint8_t)(gen > 255 ? 255 : gen);
 }
 
-/* Emission from Blender emitters. preage spreads births across the frame (sub-frame accuracy). */
-API int nv_emit(NvSys *s, int kind, int n, const float *pos, const float *vel, const float *preage) {
+/* Emission from Blender emitters. preage spreads births across the frame (sub-frame accuracy).
+ * life (optional) replaces the type's random lifetime, so a burst on death can land on an exact moment. */
+API int nv_emit_life(NvSys *s, int kind, int n, const float *pos, const float *vel, const float *preage,
+                     const float *life) {
   if (kind < 0 || kind >= s->nk || n <= 0) return 0;
   int room = (int)s->sp[SP_max_particles] - s->p.n;
   if (room <= 0) return 0;
@@ -2393,10 +2395,15 @@ API int nv_emit(NvSys *s, int kind, int n, const float *pos, const float *vel, c
     }
     init_particle(s, &s->p, base + q, kind, p, v, NULL, 0, id0 + (uint32_t)q);
     s->p.age[base + q] = pa;
+    if (life) s->p.life[base + q] = fmaxf(1e-3f, life[q]);
   }
   s->p.n += n;
   s->next_id += (uint32_t)n;
   return n;
+}
+
+API int nv_emit(NvSys *s, int kind, int n, const float *pos, const float *vel, const float *preage) {
+  return nv_emit_life(s, kind, n, pos, vel, preage, NULL);
 }
 
 static void scratch_reserve(NvSys *s, int n) {

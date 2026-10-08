@@ -10,7 +10,7 @@ import bpy
 import numpy as np
 from mathutils import Matrix, Vector
 
-from . import core
+from . import core, music_sync
 from .params import pack_kind
 from .props import FLUID_BOOL_SPEC, FLUID_INT_SPEC, FLUID_SPEC
 
@@ -355,20 +355,40 @@ def emit_frame(rt, scene, sysob, frame, dt, depsgraph):
         active = em.frame_start <= frame <= em.frame_end
         n_rate = 0
         rng = np.random.default_rng([sysob.nova.seed, em.seed, ei, frame & 0x7FFFFFFF])
-        if active and em.rate > 0:
+        mt = em.music
+        rate = em.rate * (music_sync.level_at(mt, frame) if mt.enabled and mt.mode == "RATE" else 1.0)
+        if active and rate > 0:
             if em.random_timing:
-                n_rate = int(rng.poisson(em.rate * dt))
+                n_rate = int(rng.poisson(rate * dt))
             else:
-                exact = em.rate * dt + st["carry"]
+                exact = rate * dt + st["carry"]
                 n_rate = int(exact)
                 st["carry"] = exact - n_rate
-        n = n_rate + (em.burst if frame == em.burst_frame else 0)
+        n_burst = em.burst if frame == em.burst_frame else 0
+        # music hits: (moment in the frame, particle count); "land" emits a lifetime early with that lifetime
+        life = None
+        hits = []
+        if mt.enabled and mt.mode == "BURST" and kind >= 0:
+            k = sysob.nova.kinds[kind]
+            life_s = 0.5 * (k.life_min + k.life_max) if mt.land else None
+            lead = life_s / dt if mt.land and dt > 0 else 0.0
+            for th, v in music_sync.hits_in(mt, frame, lead):
+                c = int(round(mt.count * (1 - mt.response + mt.response * v)))
+                hits.append((th, max(1, c)))
+            if life_s is not None and hits:
+                life = life_s
+        n_rate = min(n_rate, 5_000_000)
+        n_music = sum(c for _t, c in hits)
+        n = n_rate + n_burst + n_music
         if kind >= 0 and n > 0:
-            n = min(n, 5_000_000)
             p, d = sample_local(em, st, ob, depsgraph, n, rng)
             t = rng.random(n).astype(np.float32)
-            if frame == em.burst_frame and em.burst:
-                t[n_rate:] = 1.0  # bursts happen exactly on the frame
+            if n_burst:
+                t[n_rate:n_rate + n_burst] = 1.0  # bursts happen exactly on the frame
+            i = n_rate + n_burst
+            for th, c in hits:
+                t[i:i + c] = th
+                i += c
             pw0, pw1 = _xform(prev, p), _xform(cur, p)
             pos = pw0 + (pw1 - pw0) * t[:, None]
             if em.direction == "OBJECT_Z":
@@ -385,7 +405,16 @@ def emit_frame(rt, scene, sysob, frame, dt, depsgraph):
             if em.inherit != 0 and dt > 0:
                 vel += (pw1 - pw0) / dt * em.inherit
             preage = ((1 - t) * dt).astype(np.float32)
-            rt.sys.emit(kind, pos, vel, preage)
+            if life is not None and n_music:
+                # only the music births get the exact lifetime
+                lf = np.full(n, -1.0, np.float32)
+                lf[n - n_music:] = life
+                rest = n - n_music
+                if rest:
+                    rt.sys.emit(kind, pos[:rest], vel[:rest], preage[:rest])
+                rt.sys.emit(kind, pos[rest:], vel[rest:], preage[rest:], life=lf[rest:])
+            else:
+                rt.sys.emit(kind, pos, vel, preage)
         if rt.fluid and em.fl_enabled and active:
             fluid_source(rt, ob, em, st, depsgraph, cur, rng, frame)
 

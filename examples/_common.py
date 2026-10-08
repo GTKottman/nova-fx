@@ -152,10 +152,11 @@ def still(name, sysobs, frame):
     return out
 
 
-def loop(name, sysobs, first, last, step=1, width=640, fps=24, still_at=None):
+def loop(name, sysobs, first, last, step=1, width=640, fps=24, still_at=None, audio=None):
     """Render first..last (every `step`) at half size into an animated WebP that plays inline on
     GitHub; on frame `still_at` also render a full-size still. Simulation only moves forward, so
-    call this once per scene, from the earliest frame you need."""
+    call this once per scene, from the earliest frame you need. audio=(path, frame the sound starts)
+    also writes an mp4 with that sound."""
     os.makedirs(OUT, exist_ok=True)
     sc = bpy.context.scene
     os.makedirs(WORK, exist_ok=True)
@@ -176,6 +177,15 @@ def loop(name, sysobs, first, last, step=1, width=640, fps=24, still_at=None):
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", str(max(1, fps // step)), "-i",
                     os.path.join(d, "%04d.png"), "-vf", f"scale={width}:-2:flags=lanczos", "-c:v", "libwebp_anim",
                     "-quality", "75", "-compression_level", "6", "-loop", "0", out], check=True)
+    if audio:
+        mp4 = os.path.join(OUT, f"{name}.mp4")
+        delay = max(0.0, (audio[1] - first) / fps)
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", str(max(1, fps // step)), "-i",
+                        os.path.join(d, "%04d.png"), "-itsoffset", f"{delay:.3f}", "-i", audio[0],
+                        "-map", "0:v", "-map", "1:a", "-vf", f"scale={width}:-2:flags=lanczos", "-c:v", "libx264",
+                        "-pix_fmt", "yuv420p", "-crf", "20", "-c:a", "aac", "-b:a", "160k", "-shortest", mp4],
+                       check=True)
+        print(f"[{name}] with sound -> {mp4}", flush=True)
     shutil.rmtree(d, ignore_errors=True)
     print(f"[{name}] loop {first}-{last} ({n} frames): {time.perf_counter() - t:.1f}s -> {out} "
           f"({os.path.getsize(out) / 1e6:.1f} MB)", flush=True)

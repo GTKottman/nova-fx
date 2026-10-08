@@ -2,6 +2,7 @@ import bpy
 from bpy.props import (BoolProperty, CollectionProperty, EnumProperty, FloatProperty, FloatVectorProperty,
                        IntProperty, PointerProperty, StringProperty)
 
+from .music_sync import NovaMusicTrigger
 from .params import KIND_SPEC
 
 # ------------------------------------------------------------------ particle types
@@ -239,6 +240,7 @@ class NovaEmitter(bpy.types.PropertyGroup):
                            description="Source points per frame (0 = automatic)")
     fl_noise: FloatProperty(name="Source Noise", default=0.5, min=0, max=1,
                             description="Break up the source with noise so flames lick")
+    music: PointerProperty(type=NovaMusicTrigger)
 
 
 class NovaCollider(bpy.types.PropertyGroup):
