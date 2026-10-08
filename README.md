@@ -43,6 +43,7 @@ make -C core
 | Energy Vortex | Vortex + attractor forces, streak display |
 | Snow | Lit flakes that settle |
 | Particle Logo | Dust assembles into a word (any text, logo or mesh) with the Form force, holds, then scatters |
+| Burn Away | An object disintegrates along a ragged glowing front, shedding embers and ash |
 | Lightning | Cloud-to-ground strike grown by the dielectric breakdown model: stepped leader, return strokes, cooling afterglow, impact spatter. With *Camera, World & Glow*, a cloud deck the flash lights from inside |
 | Empty System | Starting point |
 
@@ -265,6 +266,27 @@ A wide fire that fills ~40% of a 6.1M-cell domain: CPU sparse 862 ms, GPU dense 
 - **Example:** [`examples/lightning_storm.py`](examples/lightning_storm.py) is a storm with three strikes, one
   of them drawn to a lightning rod on a mast.
 
+### Disintegrate
+Select any mesh and press **Disintegrate** in the Nova FX panel. A front sweeps through it (or a hole
+spreads from inside it), and an Embers & Ash system comes off the front.
+- **One number decides everything.** A Geometry Nodes modifier writes `nova_dissolve` on every point: the
+  distance in metres past the front (a plane moving along its arrow, or a sphere growing with its
+  scale), pushed back and forth by noise that sticks to the object.
+  - Below 0 the surface is gone. From 0 to *Edge* it glows (blackbody, hottest at the front). From *Edge* to
+    *Edge + Char* it is scorched toward black. Beyond that it is untouched.
+- **The material reads the attribute.** Each material is wrapped in a *Nova Dissolve Surface* group, so it
+  renders in Cycles and EEVEE with no handlers. The object gets copies of its materials; other objects that
+  share them are left alone, and turning Disintegrate off puts the originals back. *Fine Edge* adds
+  material-only raggedness below mesh resolution.
+- **Particles come off where the surface went.** A *Dissolve Front* emitter reads the same evaluated
+  attribute. It emits on triangles that crossed zero during the frame, keeps only the points that crossed,
+  and births each one at its sub-frame crossing moment. *Rate* is particles per square metre that
+  disappears. Measured: 39,432 born for 10.68 m² gone, against 39,512 expected.
+- **Flames:** turn on *Fluid Source* on a Dissolve Front emitter and fuel and heat are fed along the
+  glowing band.
+- **Example:** [`examples/burn_away.py`](examples/burn_away.py) burns a head from the chin up, with flames on
+  the edge.
+
 ### Shapes: logos, text and formations
 Any object Blender can turn into a mesh can be a shape: meshes, text (and MoBlend MoText), curves and
 imported SVG logos. Each object keeps its own sampling settings: *Surface*, *Outline* (the border: best for
@@ -350,6 +372,7 @@ Same plume, empty domain grown from 64³ to 256³ (old → now):
 python3 tests/test_core.py                                     # core: correctness + speed, ~7 s
 blender -b --factory-startup --python tests/blender_presets.py -- --frames 24
 blender -b --factory-startup --python tests/blender_lightning.py   # bolt controls, target, timeline
+blender -b --factory-startup --python tests/blender_dissolve.py    # mask, material, particles and flames agree
 blender -b --factory-startup --python tests/blender_formation.py   # sampling, the logo forms, shaped shells
 python3 tests/test_music.py                                     # MIDI parsing, onset timing, ~1 s
 blender -b --factory-startup --python tests/blender_music.py       # shells burst on the beat, bolts, drives

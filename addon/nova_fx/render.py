@@ -24,10 +24,10 @@ def _first(nt, t):
 def particle_material(sysob):
     name = f"{PMAT} · {sysob.name}"
     mat = bpy.data.materials.get(name)
-    if mat and mat.node_tree and mat.get("nova_v") == 2:
+    if mat and mat.node_tree and mat.get("nova_v") == 3:
         return mat
     mat = mat or bpy.data.materials.new(name)
-    mat["nova_v"] = 2
+    mat["nova_v"] = 3
     if not mat.node_tree:
         mat.use_nodes = True
     nt = mat.node_tree
@@ -48,6 +48,7 @@ def particle_material(sysob):
     L.new(mul.outputs[0], emis.inputs["Strength"])
     L.new(cd.outputs["Color"], bsdf.inputs["Base Color"])
     L.new(cd.outputs["Color"], bsdf.inputs["Emission Color"])
+    L.new(mul.outputs[0], bsdf.inputs["Emission Strength"])  # lit systems can mix glowing and dull types
     L.new(emis.outputs[0], mix.inputs[1])
     L.new(bsdf.outputs[0], mix.inputs[2])
     L.new(mix.outputs[0], out.inputs["Surface"])

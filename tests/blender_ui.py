@@ -110,12 +110,22 @@ def s_formation():
     L("formation added")
 def s_formation_shot():
     shot("5_formation")
+def s_dissolve():
+    w, a = area3d()
+    with bpy.context.temp_override(window=w, area=a):
+        bpy.ops.nova.add_preset(preset="DISINTEGRATE")
+    for f in range(1, 60):
+        bpy.context.scene.frame_set(f)
+    select(bpy.data.objects["Burning Monkey"])
+    L("disintegrate added")
+def s_dissolve_shot():
+    shot("6_dissolve")
 def s_quit():
     L("done")
     log.close()
     bpy.ops.wm.quit_blender()
 
-seq = [setup, s_system, s_emitter, s_emitter_shot, s_fireworks, s_fw_shot, s_music, s_music_shot, s_formation, s_formation_shot, s_quit]
+seq = [setup, s_system, s_emitter, s_emitter_shot, s_fireworks, s_fw_shot, s_music, s_music_shot, s_formation, s_formation_shot, s_dissolve, s_dissolve_shot, s_quit]
 def tick():
     if not seq:
         return None

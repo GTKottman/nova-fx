@@ -10,7 +10,7 @@ import bpy
 import numpy as np
 from mathutils import Matrix, Vector
 
-from . import core, music_sync, shapes
+from . import core, dissolve, music_sync, shapes
 from .params import pack_kind
 from .props import FLUID_BOOL_SPEC, FLUID_INT_SPEC, FLUID_SPEC
 
@@ -380,7 +380,8 @@ def emit_frame(rt, scene, sysob, frame, dt, depsgraph):
     for ei, ob in enumerate(emitters_of(scene, sysob)):
         em = ob.nova_emitter
         st = rt.em_state.setdefault(ob.name, {"carry": 0.0})
-        cur = ob.matrix_world.copy()
+        src = (em.dissolve_source or ob) if em.shape == "DISSOLVE" else ob
+        cur = src.matrix_world.copy()
         prev = st.get("prev", cur)
         st["prev"] = cur
         kind = names.index(em.kind) if em.kind in names else -1
@@ -397,6 +398,14 @@ def emit_frame(rt, scene, sysob, frame, dt, depsgraph):
                 n_rate = int(exact)
                 st["carry"] = exact - n_rate
         n_burst = em.burst if frame == em.burst_frame else 0
+        pre = None
+        if em.shape == "DISSOLVE":
+            # particles come off where the surface disappeared this frame, at the moment it did
+            n_rate = 0
+            if src.type == "MESH" and src.nova_dissolve.enabled:
+                pre = dissolve.crossing(st, src, depsgraph, rate if active else 0.0, rng,
+                                        max(src.matrix_world.to_scale()))
+                n_rate = len(pre[0]) if pre is not None else 0
         # music hits: (moment in the frame, particle count); "land" emits a lifetime early with that lifetime
         life = None
         hits = []
@@ -413,8 +422,14 @@ def emit_frame(rt, scene, sysob, frame, dt, depsgraph):
         n_music = sum(c for _t, c in hits)
         n = n_rate + n_burst + n_music
         if kind >= 0 and n > 0:
-            p, d = sample_local(em, st, ob, depsgraph, n, rng)
+            if pre is not None:
+                p, d = sample_local(em, st, ob, depsgraph, n - n_rate, rng) if n > n_rate else (pre[0][:0], pre[1][:0])
+                p, d = np.concatenate([pre[0], p]), np.concatenate([pre[1], d])
+            else:
+                p, d = sample_local(em, st, ob, depsgraph, n, rng)
             t = rng.random(n).astype(np.float32)
+            if pre is not None:
+                t[:n_rate] = pre[2]
             if n_burst:
                 t[n_rate:n_rate + n_burst] = 1.0  # bursts happen exactly on the frame
             i = n_rate + n_burst
@@ -455,6 +470,18 @@ def fluid_source(rt, ob, em, st, depsgraph, mw, rng, frame):
     f = rt.fluid
     dx = f.dx
     R = em.fl_radius if em.fl_radius > 0 else 1.5 * dx
+    if em.shape == "DISSOLVE":
+        src = em.dissolve_source or ob
+        if src.type != "MESH" or not src.nova_dissolve.enabled:
+            return
+        mw = src.matrix_world
+        d0 = src.nova_dissolve
+        n = em.fl_points or 4000
+        p = dissolve.band(src, depsgraph, d0.edge + 0.5 * d0.char, n, rng)
+        if p is None:
+            return
+        f.splat(_xform(mw, p), R, dens=em.fl_density, heat=em.fl_heat, fuel=em.fl_fuel, mode=1)
+        return
     if em.shape in {"SURFACE", "VERTS"} and ob.type == "MESH":
         if "area" not in st:
             sample_local(em, st, ob, depsgraph, 1, rng)

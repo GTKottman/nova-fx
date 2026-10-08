@@ -43,6 +43,8 @@ class NOVA_PT_main(_Panel, bpy.types.Panel):
         row.operator("nova.make", text="Force", icon="FORCE_FORCE", depress=ob.nova_force.enabled).role = "FORCE"
         if ob.nova_emitter.enabled or ob.nova_collider.enabled or ob.nova_force.enabled:
             col.operator("nova.make", text="Clear Roles", icon="X").role = "CLEAR"
+        if ob.type == "MESH" and not ob.nova_dissolve.enabled:
+            layout.operator("nova.dissolve_setup", icon="MOD_EXPLODE")
         if sysob and ob.nova_emitter.enabled:
             layout.operator("nova.select_system", text=f"System: {sysob.name}", icon="RESTRICT_SELECT_OFF")
 
@@ -280,6 +282,11 @@ class NOVA_PT_emitter(_Panel, bpy.types.Panel):
         if e.system:
             layout.prop_search(e, "kind", e.system.nova, "kinds", icon="PARTICLES")
         layout.prop(e, "shape")
+        if e.shape == "DISSOLVE":
+            layout.prop(e, "dissolve_source")
+            src = e.dissolve_source or context.object
+            if not (src.type == "MESH" and src.nova_dissolve.enabled):
+                layout.label(text="Pick an object with Disintegrate on", icon="ERROR")
         if e.shape == "SPHERE":
             layout.prop(e, "radius")
         if e.shape in {"SURFACE", "VERTS"}:
@@ -455,6 +462,39 @@ class NOVA_PT_lightning(_Panel, bpy.types.Panel):
             body.prop(lt, "music_spread")
 
 
+class NOVA_PT_dissolve(_Panel, bpy.types.Panel):
+    bl_label = "Disintegrate"
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.object
+        return ob is not None and ob.type == "MESH" and ob.nova_dissolve.enabled
+
+    def draw_header(self, context):
+        self.layout.prop(context.object.nova_dissolve, "enabled", text="")
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        d = context.object.nova_dissolve
+        layout.prop(d, "front")
+        layout.prop(d, "mode", expand=True)
+        layout.label(text="Move the front along its arrow" if d.mode == "PLANE" else "Scale the front up",
+                     icon="INFO")
+        col = layout.column(align=True)
+        col.prop(d, "noise")
+        col.prop(d, "noise_scale")
+        col.prop(d, "detail")
+        col = layout.column(align=True)
+        col.prop(d, "edge")
+        col.prop(d, "char")
+        col.prop(d, "fine")
+        col = layout.column(align=True)
+        col.prop(d, "temperature")
+        col.prop(d, "glow")
+
+
 class NOVA_UL_drives(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_prop, index=0):
         name = item.target.name if item.target else "(no object)"
@@ -528,5 +568,6 @@ def menu_add(self, context):
 
 
 CLASSES = (NOVA_UL_kinds, NOVA_PT_main, NOVA_PT_system, NOVA_PT_types, NOVA_PT_forces, NOVA_PT_fluid,
-           NOVA_PT_display, NOVA_PT_emitter, NOVA_PT_collider, NOVA_PT_force, NOVA_PT_lightning, NOVA_UL_drives,
+           NOVA_PT_display, NOVA_PT_emitter, NOVA_PT_collider, NOVA_PT_force, NOVA_PT_lightning, NOVA_PT_dissolve,
+           NOVA_UL_drives,
            NOVA_PT_music, NOVA_MT_add)
