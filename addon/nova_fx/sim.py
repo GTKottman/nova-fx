@@ -66,8 +66,13 @@ class Runtime:
         self.col_prev = {}
         self.stats = {}
         self.vdb_jobs = []
+        self.upres = None
+        self.upres_note = ""
 
     def free(self):
+        if self.upres:
+            self.upres.free()
+            self.upres = None
         self.sys.free()
         if self.fluid:
             self.fluid.free()
@@ -142,6 +147,9 @@ def ensure_fluid(rt, sysob):
     res, dx, origin = fluid_layout(sysob)
     key = (res, round(dx, 6), tuple(round(o, 5) for o in origin), fl.device)
     if rt.fluid is None or rt.fluid_key != key:
+        if rt.upres:
+            rt.upres.free()
+            rt.upres = None
         if rt.fluid:
             rt.fluid.free()
         rt.fluid = core.Fluid(res, dx, origin)
@@ -519,9 +527,51 @@ def fluid_source(rt, ob, em, st, depsgraph, mw, rng, frame):
 
 # ------------------------------------------------------------------ stepping
 
+def _mem_available():
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
+def upres_frame(rt, sysob, dt):
+    """Step the fine grid after the fluid. Skips (and says so) when it would not fit in memory."""
+    fl = sysob.nova.fluid
+    if not rt.fluid or fl.upres <= 1:
+        if rt.upres:
+            rt.upres.free()
+            rt.upres = None
+        rt.upres_note = ""
+        return
+    if rt.upres is None or rt.upres.factor != fl.upres or rt.upres.fluid is not rt.fluid:
+        if rt.upres:
+            rt.upres.free()
+        rt.upres = core.Upres(rt.fluid, fl.upres)
+    box = rt.fluid.active_bbox()
+    if box is None:
+        rt.upres_note = ""
+        rt.upres.step(dt)  # empties the fine box
+        return
+    cells = (box[1] - box[0] + 2) * (box[3] - box[2] + 2) * (box[5] - box[4] + 2) * fl.upres ** 3
+    need = cells * 32  # fields, scratch and velocity, float32
+    avail = _mem_available()
+    if avail is not None and need > 0.6 * avail:
+        rt.upres.reset()
+        rt.upres_note = f"Upres skipped: needs {need / 1e9:.1f} GB (lower Upres or Resolution)"
+        return
+    rt.upres.step(dt, fl.upres_strength, fl.upres_scale, fl.upres_speed, sysob.nova.seed)
+    rt.upres_note = f"Upres {fl.upres}x: {cells / 1e6:.1f}M cells, {rt.upres.ms():.0f} ms"
+
+
 def reset(rt, scene, sysob):
     rt.sys.reset()
     ensure_fluid(rt, sysob)
+    if rt.upres:
+        rt.upres.reset()
     if rt.fluid:
         rt.fluid.reset()
     rt.em_state.clear()
@@ -549,6 +599,7 @@ def step(scene, sysob, frame, depsgraph=None, write=True):
         rt.sys.set_forces(force_records(rt, scene, depsgraph, sysob))
         # sources first (they feed this frame's fluid step), then move, then the new births
         rt.sys.frame(dt, n.substeps, rt.fluid)
+        upres_frame(rt, sysob, dt)
         emit_frame(rt, scene, sysob, frame, dt, depsgraph)
     rt.last_frame = frame
     sim_ms = (time.perf_counter() - t0) * 1000
@@ -560,6 +611,7 @@ def step(scene, sysob, frame, depsgraph=None, write=True):
     st = rt.sys.stats(rt.fluid)
     st["frame_ms"] = sim_ms
     st["device"] = rt.gpu_note
+    st["upres"] = rt.upres_note
     st["frame"] = frame
     rt.stats = st
     return rt
@@ -593,6 +645,16 @@ def _vdb_write(path, grids_np, dx, origin, vel, ijk):
 def write_vdb(rt, sysob, frame):
     """Only the active box is copied and written: cost follows the effect, not the domain."""
     f = rt.fluid
+    up = rt.upres
+    ub = up.box() if up is not None else None
+    if ub is not None:  # the fine grid replaces the simulation's in the file
+        nx, ny, nz, i0, j0, k0 = ub
+        data = {"density": up.field(0).copy(), "heat": up.field(1).copy(), "flame": up.field(2).copy()}
+        vel = up.field(3).copy() if sysob.nova.fluid.write_velocity else None
+        rt.vdb_jobs = [j for j in rt.vdb_jobs if not j.done()]
+        rt.vdb_jobs.append(_VDB_POOL.submit(_vdb_write, volume_path(sysob, frame), data, up.dx, f.origin, vel,
+                                            (i0, j0, k0)))
+        return
     f.sync(velocity=sysob.nova.fluid.write_velocity)
     box = f.active_bbox()
     if box is None:

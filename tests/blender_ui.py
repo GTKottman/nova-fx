@@ -52,6 +52,7 @@ def setup():
     with bpy.context.temp_override(window=w, area=a):
         bpy.ops.nova.add_preset(preset="CAMPFIRE")
     L("campfire added", bpy.context.object.name)
+    bpy.context.object.nova.fluid.upres = 2
     if os.environ.get("NOVA_DEVICE"):
         bpy.context.object.nova.fluid.device = os.environ["NOVA_DEVICE"]
     for f in range(1, 25):

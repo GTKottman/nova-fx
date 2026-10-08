@@ -63,6 +63,13 @@ _SIGS = {
     "nv_frame": (None, [_vp, _vp, C.c_float, C.c_int]),
     "nv_stats": (None, [_vp, _vp, _f]),
     "nv_lightning": (C.c_int, [_f, C.c_int, _f, C.POINTER(C.c_int)]),
+    "nv_upres_new": (_vp, [_vp, C.c_int]),
+    "nv_upres_free": (None, [_vp]),
+    "nv_upres_reset": (None, [_vp]),
+    "nv_upres_step": (C.c_int, [_vp, C.c_float, _f]),
+    "nv_upres_box": (C.c_int, [_vp, C.POINTER(C.c_int)]),
+    "nv_upres_ptr": (_f, [_vp, C.c_int]),
+    "nv_upres_ms": (C.c_float, [_vp]),
 }
 
 _lib = None
@@ -236,6 +243,57 @@ class Fluid:
 
     def max_divergence(self):
         return lib().nv_fluid_max_divergence(self.h)
+
+
+class Upres:
+    """Guided detail on a grid `factor` times finer than the fluid, over its active box."""
+
+    def __init__(self, fluid, factor):
+        self.fluid = fluid  # keeps the fluid alive as long as this
+        self.factor = int(factor)
+        self.h = lib().nv_upres_new(fluid.h, self.factor)
+        if not self.h:
+            raise MemoryError("Nova FX: could not allocate the upres grid")
+
+    def free(self):
+        if self.h:
+            lib().nv_upres_free(self.h)
+            self.h = None
+
+    __del__ = free
+
+    def reset(self):
+        lib().nv_upres_reset(self.h)
+
+    def step(self, dt, strength=1.0, wavelength=2.0, speed=0.5, seed=0, cfl=1.5, passes=2):
+        """Advance one frame after the fluid stepped. Returns substeps taken (0 = nothing active)."""
+        p = np.array([strength, wavelength, speed, seed, cfl, passes], np.float32)
+        r = lib().nv_upres_step(self.h, float(dt), fptr(p))
+        if r < 0:
+            raise MemoryError("Nova FX: the upres grid does not fit in memory (lower Upres)")
+        return r
+
+    def box(self):
+        """(nx, ny, nz, i0, j0, k0) in fine cells, or None when empty."""
+        b = (C.c_int * 6)()
+        return tuple(b) if lib().nv_upres_box(self.h, b) else None
+
+    @property
+    def dx(self):
+        return self.fluid.dx / self.factor
+
+    def field(self, which):
+        """Zero-copy view (nz, ny, nx) of density=0, heat=1, flame=2, or (nz, ny, nx, 3) velocity=3."""
+        b = self.box()
+        if b is None:
+            return None
+        nx, ny, nz = b[:3]
+        ptr = lib().nv_upres_ptr(self.h, which)
+        shape = (nz, ny, nx, 3) if which == 3 else (nz, ny, nx)
+        return np.ctypeslib.as_array(ptr, shape=shape)
+
+    def ms(self):
+        return lib().nv_upres_ms(self.h)
 
 
 class System:

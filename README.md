@@ -204,6 +204,26 @@ Press Play to watch it live, or *Bake* to cache it to disk. The same settings ap
 - **Output:** OpenVDB (`density`, `heat`, `flame`, optional `velocity`) written on a background thread
   and loaded as a Blender Volume sequence with a blackbody fire material.
 
+### Upres
+*Fire & Smoke → Upres* writes the fire 2–4 times finer than it is simulated. The method is guided detail
+advection, a cheaper relative of wavelet turbulence (Kim et al. 2008):
+- A fine grid covers the fluid's active box and follows it as it grows or moves. Cells that enter it start
+  from the upsampled simulation.
+- Density, heat and flame are advected on the fine grid, by the simulated velocity plus divergence-free curl
+  noise scaled by the local gas speed (detail where the gas moves, none where it rests). *Detail* sets the
+  strength, *Detail Size* the swirl size in simulation cells, *Detail Speed* how fast it changes.
+- No pressure solve. After each frame a correction pulls the fine fields back to the simulation at its own
+  scale: two smooth (trilinear) passes, then one exact pass per coarse cell. Coarse averages match to 0.5%
+  on average. Only clamping negative values at the plume's edge leaves up to ~7% locally.
+- The VDB then holds the fine grid (and its velocity, with *Velocity Grid*). Nothing else changes, and the
+  simulation itself runs exactly as before.
+- Cost: about 60 ms per frame for a million fine cells on 16 cores. A frame whose upres would need more
+  than 60% of free memory writes the simulation grid instead and says so in the panel.
+- Measured on the campfire at 48³: half-size voxels, the same total smoke (within 1%), 1.3× the total
+  variation, and visibly broken-up flame edges and wisps.
+- **Example:** [`examples/campfire_upres.py`](examples/campfire_upres.py) is a close-up simulated at 96 and
+  written at 288.
+
 ### GPU fluid (Vulkan)
 - **Setting:** `Fire & Smoke → Device` is GPU by default. It runs the whole fluid substep in Vulkan compute
   (`core/gpu_vk.c`, `core/shaders/*.comp`) with the state resident in VRAM. Without a Vulkan GPU, or when the
@@ -372,6 +392,7 @@ Same plume, empty domain grown from 64³ to 256³ (old → now):
 python3 tests/test_core.py                                     # core: correctness + speed, ~7 s
 blender -b --factory-startup --python tests/blender_presets.py -- --frames 24
 blender -b --factory-startup --python tests/blender_lightning.py   # bolt controls, target, timeline
+blender -b --factory-startup --python tests/blender_upres.py      # fine VDBs: voxel size, smoke total, detail
 blender -b --factory-startup --python tests/blender_dissolve.py    # mask, material, particles and flames agree
 blender -b --factory-startup --python tests/blender_formation.py   # sampling, the logo forms, shaped shells
 python3 tests/test_music.py                                     # MIDI parsing, onset timing, ~1 s

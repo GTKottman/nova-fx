@@ -89,6 +89,8 @@ class NOVA_PT_system(_Panel, bpy.types.Panel):
                 c.label(text=st["device"], icon="CHECKMARK" if st["device"].startswith("GPU:") else "INFO")
             if st.get("cells"):
                 c.label(text=f"Fluid {st['fluid_ms']:.0f} ms · {st['cg_iters']} pressure iterations")
+                if st.get("upres"):
+                    c.label(text=st["upres"], icon="ERROR" if "skipped" in st["upres"] else "MOD_REMESH")
                 where = "on the GPU" if str(st.get("device", "")).startswith("GPU:") else "on the CPU"
                 if n.fluid.sparse:
                     c.label(text=f"{st['active'] * 100:.0f}% of {st['cells'] / 1e6:.2f}M cells active {where} (sparse)")
@@ -234,6 +236,23 @@ class NOVA_PT_fluid(_Panel, bpy.types.Panel):
                     body.prop(fl, name)
                 for name, *_ in FLUID_BOOL_SPEC:
                     body.prop(fl, name)
+        header, body = layout.panel("nova_fluid_upres", default_closed=fl.upres <= 1)
+        header.label(text="Upres")
+        if body:
+            body.prop(fl, "upres", text="Factor")
+            sub = body.column()
+            sub.active = fl.upres > 1
+            sub.prop(fl, "upres_strength")
+            sub.prop(fl, "upres_scale")
+            sub.prop(fl, "upres_speed")
+            if fl.upres > 1 and fl.domain:
+                try:
+                    res, dx, _o = sim.fluid_layout(_sys(context))
+                    body.label(text=f"Voxels {dx * 100 / fl.upres:.2f} cm · at most "
+                                    f"{res[0] * res[1] * res[2] * fl.upres ** 3 * 32 / 1e9:.1f} GB "
+                                    f"if the fire fills the domain", icon="INFO")
+                except Exception:
+                    pass
         header, body = layout.panel("nova_fluid_look", default_closed=False)
         header.label(text="Look")
         if body:

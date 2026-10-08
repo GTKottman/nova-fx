@@ -3162,6 +3162,243 @@ API int nv_sys_export(NvSys *s, float *P3, float *V3, float *C3, float *R, float
   return n;
 }
 
+/* ========================================================================== upres
+ * Guided detail on a finer grid (k = 2..4 times the fluid's resolution) over the fluid's active box.
+ * Smoke, heat and flame ride the fluid's velocity plus divergence-free curl noise, scaled by the local
+ * speed (detail where the gas moves). No pressure solve: after each frame a smooth correction (the coarse
+ * difference, upsampled trilinearly) pulls the fine fields back to the fluid at the coarse scale, so the
+ * detail can never drift away from the simulation. The fine box follows the active region; cells that
+ * enter it start from the upsampled fluid. */
+typedef struct NvUpres {
+  NvFluid *f;
+  int k;
+  int box[6];       /* coarse cells covered: [i0,i1) [j0,j1) [k0,k1) */
+  int nx, ny, nz;   /* fine cells */
+  float *fld[3];    /* density, heat, flame */
+  float *tmp;
+  float *vel;       /* fine-cell velocity [n][3] */
+  float *corr;      /* coarse correction box */
+  double time, ms;
+} NvUpres;
+
+static float upres_noise_rms(void) {
+  static float rms = 0.f;
+  if (rms > 0.f) return rms;
+  double acc = 0;
+  for (int i = 0; i < 4096; i++) {
+    float c[3];
+    curl_noise(u01(pcg(i * 3u + 1)) * 50.f, u01(pcg(i * 3u + 2)) * 50.f, u01(pcg(i * 3u + 3)) * 50.f, 0.f, 2,
+               77u, c);
+    acc += c[0] * c[0] + c[1] * c[1] + c[2] * c[2];
+  }
+  rms = (float)sqrt(acc / 4096.0);
+  return rms > 1e-6f ? rms : 1.f;
+}
+
+API NvUpres *nv_upres_new(NvFluid *f, int k) {
+  NvUpres *u = (NvUpres *)calloc(1, sizeof(NvUpres));
+  if (!u) return NULL;
+  u->f = f;
+  u->k = k < 2 ? 2 : (k > 6 ? 6 : k);
+  return u;
+}
+
+static void upres_release(NvUpres *u) {
+  for (int a = 0; a < 3; a++) { free(u->fld[a]); u->fld[a] = NULL; }
+  free(u->tmp); free(u->vel); free(u->corr);
+  u->tmp = u->vel = u->corr = NULL;
+  u->nx = u->ny = u->nz = 0;
+  memset(u->box, 0, sizeof u->box);
+}
+
+API void nv_upres_free(NvUpres *u) {
+  if (!u) return;
+  upres_release(u);
+  free(u);
+}
+
+API void nv_upres_reset(NvUpres *u) {
+  upres_release(u);
+  u->time = 0;
+}
+
+static inline const float *fluid_field(const NvFluid *f, int a) { return a == 0 ? f->d : (a == 1 ? f->T : f->flame); }
+
+/* move the fine box to cover `nb` (coarse cells): keep the overlap, start new cells from the fluid */
+static int upres_rebox(NvUpres *u, const int *nb) {
+  NvFluid *f = u->f;
+  int k = u->k;
+  int nx = (nb[1] - nb[0]) * k, ny = (nb[3] - nb[2]) * k, nz = (nb[5] - nb[4]) * k;
+  size_t n = (size_t)nx * ny * nz;
+  float *nf[3];
+  for (int a = 0; a < 3; a++) {
+    nf[a] = (float *)malloc(sizeof(float) * (n ? n : 1));
+    if (!nf[a]) {
+      for (int b = 0; b < a; b++) free(nf[b]);
+      return 0;
+    }
+  }
+  int ox = (nb[0] - u->box[0]) * k, oy = (nb[2] - u->box[2]) * k, oz = (nb[4] - u->box[4]) * k;
+  int have = u->fld[0] != NULL;
+  for (int a = 0; a < 3; a++) {
+    const float *src = fluid_field(f, a), *old = u->fld[a];
+    float *dst = nf[a];
+#pragma omp parallel for schedule(static)
+    for (int K = 0; K < nz; K++)
+      for (int J = 0; J < ny; J++)
+        for (int I = 0; I < nx; I++) {
+          int oi = I + ox, oj = J + oy, ok = K + oz;
+          size_t c = (size_t)I + (size_t)nx * ((size_t)J + (size_t)ny * K);
+          if (have && oi >= 0 && oj >= 0 && ok >= 0 && oi < u->nx && oj < u->ny && ok < u->nz)
+            dst[c] = old[(size_t)oi + (size_t)u->nx * ((size_t)oj + (size_t)u->ny * ok)];
+          else /* new cell: start from the fluid, upsampled */
+            dst[c] = samp(src, f->nx, f->ny, f->nz, nb[0] + (I + 0.5f) / k - 0.5f, nb[2] + (J + 0.5f) / k - 0.5f,
+                          nb[4] + (K + 0.5f) / k - 0.5f, 0);
+        }
+  }
+  upres_release(u);
+  for (int a = 0; a < 3; a++) u->fld[a] = nf[a];
+  u->tmp = (float *)malloc(sizeof(float) * (n ? n : 1));
+  u->vel = (float *)malloc(sizeof(float) * 3 * (n ? n : 1));
+  u->corr = (float *)malloc(sizeof(float) * (size_t)(nb[1] - nb[0]) * (nb[3] - nb[2]) * (nb[5] - nb[4]) + 4);
+  memcpy(u->box, nb, sizeof u->box);
+  u->nx = nx; u->ny = ny; u->nz = nz;
+  return u->tmp && u->vel && u->corr;
+}
+
+/* params: [strength, wavelength (coarse cells), evolution speed, seed, cfl, guide passes] */
+API int nv_upres_step(NvUpres *u, float dt, const float *p) {
+  double t0 = now_ms();
+  NvFluid *f = u->f;
+  ftz();
+  if (f->gpu) nv_fluid_sync(f, 1);
+  int b[6];
+  if (!nv_fluid_active_bbox(f, b)) {
+    upres_release(u);
+    return 0;
+  }
+  int dims[3] = {f->nx, f->ny, f->nz};
+  for (int a = 0; a < 3; a++) { /* a coarse cell of margin so detail can leave the active region */
+    b[2 * a] = b[2 * a] > 0 ? b[2 * a] - 1 : 0;
+    b[2 * a + 1] = b[2 * a + 1] < dims[a] ? b[2 * a + 1] + 1 : dims[a];
+  }
+  if (memcmp(b, u->box, sizeof b) || !u->fld[0])
+    if (!upres_rebox(u, b)) {
+      upres_release(u);
+      return -1;
+    }
+  const int k = u->k, nx = u->nx, ny = u->ny, nz = u->nz;
+  const float dxf = f->dx / k, amp = p[0], lam = p[1] > 0.05f ? p[1] : 0.05f, tsp = p[2];
+  const uint32_t sd = (uint32_t)p[3] * 2654435761u + 99u;
+  const float cfl = p[4] > 0.5f ? p[4] : 0.5f;
+  const float fr = 1.f / (lam * f->dx), inv_rms = 1.f / upres_noise_rms();
+  const float tm = (float)(u->time + 0.5 * dt) * tsp;
+  /* fine velocity: the fluid's, plus curl noise scaled by the local speed */
+  float vmax = 0.f;
+#pragma omp parallel for schedule(static) reduction(max : vmax)
+  for (int K = 0; K < nz; K++)
+    for (int J = 0; J < ny; J++)
+      for (int I = 0; I < nx; I++) {
+        size_t c = (size_t)I + (size_t)nx * ((size_t)J + (size_t)ny * K);
+        float x = u->box[0] + (I + 0.5f) / k, y = u->box[2] + (J + 0.5f) / k, z = u->box[4] + (K + 0.5f) / k;
+        float v[3];
+        vel_at(f, f->u, f->v, f->w, x, y, z, v);
+        float sp = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+        if (amp > 0.f && sp > 1e-4f) {
+          float cn[3], wx = f->o[0] + x * f->dx, wy = f->o[1] + y * f->dx, wz = f->o[2] + z * f->dx;
+          curl_noise(wx * fr, wy * fr, wz * fr, tm, 2, sd, cn);
+          float s = amp * sp * inv_rms;
+          v[0] += cn[0] * s; v[1] += cn[1] * s; v[2] += cn[2] * s;
+        }
+        u->vel[3 * c] = v[0]; u->vel[3 * c + 1] = v[1]; u->vel[3 * c + 2] = v[2];
+        float m = fabsf(v[0]) > fabsf(v[1]) ? fabsf(v[0]) : fabsf(v[1]);
+        m = m > fabsf(v[2]) ? m : fabsf(v[2]);
+        vmax = m > vmax ? m : vmax;
+      }
+  int ns = (int)ceilf(vmax * dt / (cfl * dxf));
+  ns = ns < 1 ? 1 : (ns > 8 ? 8 : ns);
+  const float h = dt / ns, hs = h / dxf; /* fine cells per (m/s) per substep */
+  /* semi-Lagrangian advection, midpoint backtrace through the fine velocity */
+  for (int s = 0; s < ns; s++)
+    for (int a = 0; a < 3; a++) {
+      const float *src = u->fld[a];
+      float *dst = u->tmp;
+#pragma omp parallel for schedule(static)
+      for (int K = 0; K < nz; K++)
+        for (int J = 0; J < ny; J++)
+          for (int I = 0; I < nx; I++) {
+            size_t c = (size_t)I + (size_t)nx * ((size_t)J + (size_t)ny * K);
+            const float *v = u->vel + 3 * c;
+            float mx = I - 0.5f * hs * v[0], my = J - 0.5f * hs * v[1], mz = K - 0.5f * hs * v[2];
+            /* velocity at the midpoint (interleaved array: trilinear per component) */
+            float x = clampf(mx, 0.f, nx - 1.f), y = clampf(my, 0.f, ny - 1.f), z = clampf(mz, 0.f, nz - 1.f);
+            int i0 = (int)x, j0 = (int)y, k0 = (int)z;
+            int i1 = i0 + 1 < nx ? i0 + 1 : i0, j1 = j0 + 1 < ny ? j0 + 1 : j0, k1 = k0 + 1 < nz ? k0 + 1 : k0;
+            float tx = x - i0, ty = y - j0, tz = z - k0, w3[3];
+            for (int q = 0; q < 3; q++) {
+#define VF(ii, jj, kk) u->vel[3 * ((size_t)(ii) + (size_t)nx * ((size_t)(jj) + (size_t)ny * (kk))) + q]
+              w3[q] = lerpf(lerpf(lerpf(VF(i0, j0, k0), VF(i1, j0, k0), tx), lerpf(VF(i0, j1, k0), VF(i1, j1, k0), tx), ty),
+                            lerpf(lerpf(VF(i0, j0, k1), VF(i1, j0, k1), tx), lerpf(VF(i0, j1, k1), VF(i1, j1, k1), tx), ty), tz);
+#undef VF
+            }
+            dst[c] = samp(src, nx, ny, nz, I - hs * w3[0], J - hs * w3[1], K - hs * w3[2], 0);
+          }
+      float *t = u->fld[a];
+      u->fld[a] = u->tmp;
+      u->tmp = t;
+    }
+  /* guide: add the upsampled coarse difference so the fine fields average to the fluid's */
+  const int cx = b[1] - b[0], cy = b[3] - b[2], cz = b[5] - b[4];
+  const float ik3 = 1.f / (float)(k * k * k);
+  /* smooth passes (trilinear correction: no blocks, converges slowly at sharp edges), then one exact pass
+   * (constant per coarse cell: the averages match; the residual left by then is too small to show blocks) */
+  const int passes = (p[5] >= 1.f ? (int)p[5] : 2) + 1;
+  for (int a = 0; a < 3; a++)
+  for (int pass = 0; pass < passes; pass++) {
+    const int exact = pass == passes - 1;
+    const float *src = fluid_field(f, a);
+    float *F = u->fld[a];
+#pragma omp parallel for schedule(static)
+    for (int kc = 0; kc < cz; kc++)
+      for (int jc = 0; jc < cy; jc++)
+        for (int ic = 0; ic < cx; ic++) {
+          double sum = 0;
+          for (int dz = 0; dz < k; dz++)
+            for (int dy = 0; dy < k; dy++) {
+              size_t row = (size_t)(ic * k) + (size_t)nx * ((size_t)(jc * k + dy) + (size_t)ny * (kc * k + dz));
+              for (int dx = 0; dx < k; dx++) sum += F[row + dx];
+            }
+          size_t cc = (size_t)ic + (size_t)cx * ((size_t)jc + (size_t)cy * kc);
+          u->corr[cc] = src[CI(f, b[0] + ic, b[2] + jc, b[4] + kc)] - (float)(sum * ik3);
+        }
+#pragma omp parallel for schedule(static)
+    for (int K = 0; K < nz; K++)
+      for (int J = 0; J < ny; J++)
+        for (int I = 0; I < nx; I++) {
+          size_t c = (size_t)I + (size_t)nx * ((size_t)J + (size_t)ny * K);
+          float d = exact ? u->corr[(size_t)(I / k) + (size_t)cx * ((size_t)(J / k) + (size_t)cy * (K / k))]
+                          : samp(u->corr, cx, cy, cz, (I + 0.5f) / k - 0.5f, (J + 0.5f) / k - 0.5f,
+                                 (K + 0.5f) / k - 0.5f, 0);
+          float v = F[c] + d;
+          F[c] = v > 0.f ? v : 0.f;
+        }
+  }
+  u->time += dt;
+  u->ms = now_ms() - t0;
+  return ns;
+}
+
+/* fine box: out = [nx, ny, nz, i0, j0, k0] in fine cells (i0 = coarse i0 * k); returns 0 when empty */
+API int nv_upres_box(const NvUpres *u, int *out) {
+  out[0] = u->nx; out[1] = u->ny; out[2] = u->nz;
+  out[3] = u->box[0] * u->k; out[4] = u->box[2] * u->k; out[5] = u->box[4] * u->k;
+  return u->fld[0] != NULL && u->nx > 0;
+}
+
+/* 0 density, 1 heat, 2 flame ([nz][ny][nx]); 3 velocity ([nz][ny][nx][3]) */
+API float *nv_upres_ptr(NvUpres *u, int which) { return which < 3 ? u->fld[which] : u->vel; }
+API float nv_upres_ms(const NvUpres *u) { return (float)u->ms; }
+
 /* ======================================================================== lightning */
 
 /* Dielectric breakdown model (Niemeyer, Pietronero & Wiesmann 1984) grown with the fast Laplacian-growth
