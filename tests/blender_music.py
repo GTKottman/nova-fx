@@ -162,5 +162,17 @@ ui.draw_trigger(st, bolt.nova_lightning.music)
 check({"source", "notes", "threshold", "mode", "count", "land", "release", "every"} <= drawn,
       f"trigger panel draws {len(drawn)} settings across modes")
 
+# after a sync, live playback simulates again (the sync restarts it from the start frame)
+fw.nova.live = True
+for ob in sc.objects:
+    if ob.nova_emitter.enabled and ob.nova_emitter.system == fw:
+        ob.nova_emitter.rate = 5.0
+sc.frame_set(40)
+bpy.ops.nova.music_sync()
+for f in range(sc.frame_current + 1, sc.frame_current + 30):
+    sc.frame_set(f)
+check(sim._RT.get(fw.name) is not None and sim._RT[fw.name].sys.count() > 0,
+      f"playback simulates after a sync ({sim._RT[fw.name].sys.count() if fw.name in sim._RT else 0} particles)")
+
 print("ALL OK" if ok else "SOME CHECKS FAILED")
 sys.exit(0 if ok else 1)

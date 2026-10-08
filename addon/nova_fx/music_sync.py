@@ -434,10 +434,14 @@ class NOVA_OT_music_sync(bpy.types.Operator):
                                      "add a drive")
         elif msgs:
             self.report({"INFO"}, "Synced: " + "; ".join(msgs[:4]) + (" ..." if len(msgs) > 4 else ""))
-        # cached frames came from the old timing
+        # cached frames came from the old timing: restart the live simulation from the start (it only
+        # starts there, so staying on the current frame would leave playback with nothing to show)
         from . import sim
-        for sysob in sim.systems(context.scene):
+        systems = sim.systems(context.scene)
+        for sysob in systems:
             sim._RT.pop(sysob.name, None)
+        if systems:
+            context.scene.frame_set(min(s.nova.frame_start for s in systems))
         return {"FINISHED"}
 
 
