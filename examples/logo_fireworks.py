@@ -51,7 +51,7 @@ n.kinds["Shell Chrysanthemum"].death_count = 220
 
 cam = sc.camera
 cam.location = (0, -170, 10)
-look_at(cam, (0, 0, 66))
-cam.data.lens = 26
+look_at(cam, (0, 0, 64))
+cam.data.lens = 40  # the word (about 42 m across), the star and the chrysanthemum fill the frame
 render_settings(res=(1280, 720), samples=64)
 loop("logo_fireworks", [show], 90, 250, step=2, width=640, still_at=135)

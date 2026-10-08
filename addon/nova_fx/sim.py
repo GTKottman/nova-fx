@@ -744,6 +744,13 @@ def ensure_volume_object(scene, sysob):
     from . import render
     fl = sysob.nova.fluid
     first = volume_path(sysob, max(sysob.nova.frame_start, 1))
+    if not os.path.exists(first):
+        # the fire began after the first frame (a domain added mid-way): any file of the sequence will do,
+        # the frame number in its name maps to the scene frame
+        d = cache_dir(sysob)
+        vdbs = sorted(f for f in os.listdir(d) if re.match(r"v_\d+\.vdb$", f)) if os.path.isdir(d) else []
+        if vdbs:
+            first = os.path.join(d, vdbs[0])
     vob = fl.volume
     if vob is None or vob.name not in bpy.data.objects:
         vol = bpy.data.volumes.new(sysob.name + " Fire")
