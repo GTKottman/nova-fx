@@ -73,6 +73,12 @@ class NOVA_OT_bake(bpy.types.Operator):
         self.frame = n.frame_start
         self.t0 = time.perf_counter()
         sim.STATE["baking"] = True
+        # a liquid's surface is meshed for display only: skip it while baking (restored when done)
+        surf = n.fluid.surface
+        self.surf_mod = surf.modifiers.get("Nova Surface") if surf else None
+        if self.surf_mod is not None:
+            self.surf_was = self.surf_mod.show_viewport
+            self.surf_mod.show_viewport = False
         wm = context.window_manager
         wm.progress_begin(n.frame_start, n.frame_end)
         self._timer = wm.event_timer_add(0.001, window=context.window)
@@ -84,9 +90,11 @@ class NOVA_OT_bake(bpy.types.Operator):
         wm.event_timer_remove(self._timer)
         wm.progress_end()
         sim.STATE["baking"] = False
+        if getattr(self, "surf_mod", None) is not None:
+            self.surf_mod.show_viewport = self.surf_was
         sysob = self.sysob
         sim.wait_vdb(sysob)
-        if sysob.nova.fluid.enabled and sysob.nova.fluid.domain:
+        if sysob.nova.fluid.enabled and sysob.nova.fluid.domain and sysob.nova.fluid.mode == "GAS":
             sim.ensure_volume_object(context.scene, sysob)
             sim.refresh_volume(sysob)
         context.workspace.status_text_set(None)

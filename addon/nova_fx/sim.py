@@ -119,6 +119,9 @@ def apply_params(rt, scene, sysob):
         vals.update({name: getattr(fl, name) for name, *_ in FLUID_INT_SPEC})
         vals.update({name: float(getattr(fl, name)) for name, *_ in FLUID_BOOL_SPEC})
         vals.update(wind_x=fl.wind[0], wind_y=fl.wind[1], wind_z=fl.wind[2], seed=n.seed)
+        if fl.mode == "LIQUID":
+            walls = ["OPEN", "TANK", "BOX"].index(fl.walls)
+            vals.update(liquid=1.0, flip=fl.flip, walls=float(walls), closed_floor=float(walls > 0), sparse=1.0)
         rt.fluid.set_params(vals)
 
 
@@ -145,7 +148,8 @@ def ensure_fluid(rt, sysob):
             rt.sys.set_fluid(None)
         return
     res, dx, origin = fluid_layout(sysob)
-    key = (res, round(dx, 6), tuple(round(o, 5) for o in origin), fl.device)
+    device = "CPU" if fl.mode == "LIQUID" else fl.device  # the liquid solver runs on the CPU
+    key = (res, round(dx, 6), tuple(round(o, 5) for o in origin), device)
     if rt.fluid is None or rt.fluid_key != key:
         if rt.upres:
             rt.upres.free()
@@ -154,8 +158,8 @@ def ensure_fluid(rt, sysob):
             rt.fluid.free()
         rt.fluid = core.Fluid(res, dx, origin)
         rt.fluid_key = key
-        rt.gpu_note = ""
-        if fl.device == "GPU":
+        rt.gpu_note = "CPU (liquid)" if fl.mode == "LIQUID" else ""
+        if device == "GPU":
             if rt.fluid.use_gpu(True):
                 rt.gpu_note = "GPU: " + core.gpu_name()
             else:
@@ -336,8 +340,44 @@ def _random_dirs(n, rng):
     return np.stack([r * np.cos(a), r * np.sin(a), z], 1).astype(np.float32)
 
 
+def _volume_points(st, ob, depsgraph, n, rng):
+    """n points inside a closed mesh (local space): rejection against its distance field (cached)."""
+    me = ob.data
+    key = (me.name, len(me.vertices), tuple(round(v, 5) for c in ob.bound_box for v in c))
+    if st.get("vol_key") != key:
+        origin, dx, dist = bake_sdf(ob, depsgraph, 40)
+        st["vol_key"], st["vol_sdf"] = key, (np.array(origin, np.float32), dx, dist)
+    origin, dx, dist = st["vol_sdf"]
+    nz, ny, nx = dist.shape
+    inside = np.argwhere(dist < 0)  # cells known to be inside: sample around them, then test exactly
+    if len(inside) == 0:
+        return np.zeros((0, 3), np.float32)
+    out, got = [], 0
+    for _ in range(8):
+        m = int((n - got) * 1.6) + 16
+        c = inside[rng.integers(0, len(inside), m)][:, ::-1].astype(np.float32)  # (i, j, k)
+        p = c + rng.random((m, 3), dtype=np.float32) - 0.5
+        i0 = np.clip(np.floor(p).astype(int), 0, [nx - 2, ny - 2, nz - 2])
+        t = p - i0
+        d = 0.0
+        for corner in range(8):
+            o = np.array([(corner >> 0) & 1, (corner >> 1) & 1, (corner >> 2) & 1])
+            w = np.prod(np.where(o, t, 1 - t), axis=1)
+            d = d + w * dist[i0[:, 2] + o[2], i0[:, 1] + o[1], i0[:, 0] + o[0]]
+        keep = p[d < 0]
+        out.append(origin + keep * dx)
+        got += len(keep)
+        if got >= n:
+            break
+    pts = np.concatenate(out)[:n].astype(np.float32)
+    return pts
+
+
 def sample_local(em, st, ob, depsgraph, n, rng):
     """n local-space points + local outward directions for the emitter's shape."""
+    if em.shape == "VOLUME" and ob.type == "MESH":
+        p = _volume_points(st, ob, depsgraph, n, rng)
+        return p, _random_dirs(len(p), rng)
     if em.shape in {"SURFACE", "VERTS"} and ob.type == "MESH":
         if em.deforming or "co" not in st:
             co, tri = _mesh_tris(ob, depsgraph)
@@ -435,6 +475,11 @@ def emit_frame(rt, scene, sysob, frame, dt, depsgraph):
                 p, d = np.concatenate([pre[0], p]), np.concatenate([pre[1], d])
             else:
                 p, d = sample_local(em, st, ob, depsgraph, n, rng)
+            if len(p) < n:  # a volume can come back short (thin or open mesh): emit what fits
+                n_rate, n_burst, n_music, hits = min(n_rate, len(p)), max(0, min(n_burst, len(p) - n_rate)), 0, []
+                n = n_rate + n_burst
+                if n == 0:
+                    continue
             t = rng.random(n).astype(np.float32)
             if pre is not None:
                 t[:n_rate] = pre[2]
@@ -541,7 +586,7 @@ def _mem_available():
 def upres_frame(rt, sysob, dt):
     """Step the fine grid after the fluid. Skips (and says so) when it would not fit in memory."""
     fl = sysob.nova.fluid
-    if not rt.fluid or fl.upres <= 1:
+    if not rt.fluid or fl.upres <= 1 or fl.mode == "LIQUID":
         if rt.upres:
             rt.upres.free()
             rt.upres = None
@@ -606,7 +651,7 @@ def step(scene, sysob, frame, depsgraph=None, write=True):
     if write:
         os.makedirs(cache_dir(sysob), exist_ok=True)
         rt.sys.write(particle_path(sysob, frame))
-        if rt.fluid:
+        if rt.fluid and n.fluid.mode == "GAS":
             write_vdb(rt, sysob, frame)
     st = rt.sys.stats(rt.fluid)
     st["frame_ms"] = sim_ms
@@ -715,7 +760,10 @@ def load_into(sysob, data):
     _set_attr(pc, "velocity", "FLOAT_VECTOR", pick(data["V"], 3).astype(np.float32).ravel(), "vector")
     _set_attr(pc, "age", "FLOAT", pick(data["age"]).astype(np.float32), "value")
     _set_attr(pc, "id", "INT", pick(data["id"]).view(np.int32), "value")
-    _set_attr(pc, "kind", "INT", pick(data["kind"]).astype(np.int32), "value")
+    kinds = pick(data["kind"]).astype(np.int32)
+    _set_attr(pc, "kind", "INT", kinds, "value")
+    liquid = np.array([k.liquid for k in sysob.nova.kinds] or [False], bool)
+    _set_attr(pc, "nova_liquid", "BOOLEAN", liquid[np.minimum(kinds, len(liquid) - 1)], "value")
     pc.update_tag()
 
 
@@ -795,7 +843,7 @@ def on_frame_change(scene, depsgraph=None):
             except Exception as e:  # never break playback
                 print("Nova FX:", e)
             load_frame(sysob, frame)
-            if n.fluid.enabled and n.fluid.domain:
+            if n.fluid.enabled and n.fluid.domain and n.fluid.mode == "GAS":
                 wait_vdb(sysob)
                 ensure_volume_object(scene, sysob)
                 refresh_volume(sysob)

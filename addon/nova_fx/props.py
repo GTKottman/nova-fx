@@ -106,6 +106,26 @@ def _fluid_annotations():
         ann[name] = BoolProperty(name=label, default=d, description=desc)
     ann["wind"] = FloatVectorProperty(name="Wind", subtype="VELOCITY", size=3, default=(0, 0, 0))
     ann["enabled"] = BoolProperty(name="Fluid", default=False, description="Simulate smoke and fire on a grid")
+    ann["mode"] = EnumProperty(name="Mode", items=[
+        ("GAS", "Fire & Smoke", "Gas: smoke, heat, fuel and flame on the grid"),
+        ("LIQUID", "Liquid", "FLIP liquid: the particle types marked Liquid are the water. Runs on the CPU"),
+    ], default="GAS", update=lambda s, c: _liquid_update(s, c))
+    ann["flip"] = FloatProperty(name="FLIP", default=0.95, min=0, max=1,
+                                description="1 = lively splashes (pure FLIP), 0 = calm and damped (PIC)")
+    ann["walls"] = EnumProperty(name="Walls", items=[
+        ("OPEN", "Open", "Liquid leaving the domain is gone"),
+        ("TANK", "Tank", "Floor and sides are walls, the top is open"),
+        ("BOX", "Box", "Closed on every side"),
+    ], default="TANK")
+    ann["surface"] = PointerProperty(name="Surface Object", type=bpy.types.Object)
+    ann["surface_radius"] = FloatProperty(name="Surface Radius", default=1.2, min=0.2, soft_max=3,
+                                          update=lambda s, c: _liquid_update(s, c),
+                                          description="Particle radius for the surface, in grid cells. Bigger "
+                                                      "blends drops into smooth water (the surface is pulled back in "
+                                                      "to keep the volume)")
+    ann["surface_smooth"] = IntProperty(name="Smoothing", default=8, min=0, max=30,
+                                        update=lambda s, c: _liquid_update(s, c),
+                                        description="Laplacian smoothing passes on the surface")
     ann["device"] = EnumProperty(name="Device", items=[
         ("CPU", "CPU", "Solver on all CPU cores"),
         ("GPU", "GPU", "Vulkan compute on the graphics card: usually several times faster than the CPU. "
@@ -141,6 +161,11 @@ def _fluid_annotations():
     ann["smoke_color"] = FloatVectorProperty(name="Smoke Color", subtype="COLOR", size=3, min=0, max=1,
                                              default=(0.12, 0.11, 0.1), update=lambda s, c: _material_update(s, c))
     return ann
+
+
+def _liquid_update(self, context):
+    from . import render
+    render.sync_liquid(self.id_data)
 
 
 def _material_update(self, context):
@@ -217,6 +242,7 @@ class NovaEmitter(bpy.types.PropertyGroup):
         ("SPHERE", "Sphere", "From inside a sphere around the origin"),
         ("SURFACE", "Surface", "From the mesh surface (area weighted)"),
         ("VERTS", "Vertices", "From mesh vertices"),
+        ("VOLUME", "Volume", "From inside the mesh (a closed mesh: fill a glass, a block of water)"),
         ("DISSOLVE", "Dissolve Front", "Where a disintegrating object burns away: Rate = particles per square "
                                        "metre that disappears"),
     ], default="POINT")

@@ -195,6 +195,25 @@ def night_world(context, color=(0.0015, 0.002, 0.005)):
     context.scene.world = w
 
 
+def day_world(context):
+    """A physical sky: clear water needs something bright to refract and reflect."""
+    w = bpy.data.worlds.get("Nova Day") or bpy.data.worlds.new("Nova Day")
+    if not w.node_tree:
+        w.use_nodes = True
+    nt = w.node_tree
+    bg = next((n for n in nt.nodes if n.type == "BACKGROUND"), None)
+    if bg is not None and not any(n.type == "TEX_SKY" for n in nt.nodes):
+        sky = nt.nodes.new("ShaderNodeTexSky")
+        try:
+            sky.sun_elevation = math.radians(35)
+            sky.sun_rotation = math.radians(-30)
+        except AttributeError:
+            pass
+        nt.links.new(sky.outputs["Color"], bg.inputs["Color"])
+        bg.inputs["Strength"].default_value = 0.35
+    context.scene.world = w
+
+
 def _offset(coll, offset):
     for ob in coll.objects:
         if ob.parent is None and ob.type != "CAMERA":
@@ -598,6 +617,55 @@ def build_disintegrate(context, coll):
     return burn_particles(context, coll, ob, name="Disintegrate")
 
 
+def build_liquid(context, coll):
+    """Dam break: a column of water falls, hits a ball and sloshes around a tank."""
+    s = new_system(context, coll, "Splash Tank", [
+        dict(name="Water", liquid=True, color_mode="FIXED", color=(0.25, 0.5, 0.9), color_var=0.0, life_min=1e5,
+             life_max=1e5, size_start=0.01, size_end=0.01, size_var=0.0, emit=0.0, gravity=1.0, fade_in=0.0,
+             fade_out=0.0, collide="BOUNCE"),
+    ], frame_end=min(context.scene.frame_end, 160), substeps=1, shading="LIT")
+    fl = s.nova.fluid
+    domain(coll, s, (2.4, 1.0, 1.4), (0, 0, 0.7), 64, mode="LIQUID", flip=0.95, walls="TANK", cfl=1.0, max_sub=8)
+    dx = 2.4 / 64
+    block = _mesh(coll, "Water Column", lambda bm: bmesh.ops.create_cube(bm, size=1.0), (-0.8, 0, 0.42))
+    block.scale = (0.7, 0.9, 0.8)
+    block.display_type, block.hide_render = "WIRE", True
+    count = int(0.7 * 0.9 * 0.8 / dx ** 3 * 8)  # eight particles per cell
+    f0 = s.nova.frame_start
+    emitter(coll, s, "Water Column", "Water", None, ob=block, shape="VOLUME", rate=0, burst=count, burst_frame=f0,
+            direction="RANDOM", speed=0.0, speed_var=0.0)
+    rock_mat = _plain_material("Nova Stone", (0.18, 0.17, 0.16), 0.5)
+    ball = _mesh(coll, "Obstacle", lambda bm: bmesh.ops.create_uvsphere(bm, u_segments=32, v_segments=16,
+                                                                          radius=0.22), (0.35, 0.05, 0.22),
+                 mat=rock_mat)
+    for f in ball.data.polygons:
+        f.use_smooth = True
+    ball.nova_collider.enabled, ball.nova_collider.shape = True, "SPHERE"
+    tank_mat = _plain_material("Nova Tank", (0.35, 0.37, 0.4), 0.4)
+    tiles = _plain_material("Nova Tank Tiles", (0.7, 0.72, 0.75), 0.3)
+    nt = tiles.node_tree
+    if not any(n.type == "TEX_CHECKER" for n in nt.nodes):  # a pattern under the water shows the refraction
+        chk = nt.nodes.new("ShaderNodeTexChecker")
+        chk.inputs["Scale"].default_value = 12.0
+        chk.inputs["Color1"].default_value = (0.75, 0.78, 0.8, 1)
+        chk.inputs["Color2"].default_value = (0.25, 0.32, 0.4, 1)
+        tc = nt.nodes.new("ShaderNodeTexCoord")
+        nt.links.new(tc.outputs["Object"], chk.inputs["Vector"])
+        nt.links.new(chk.outputs["Color"], next(n for n in nt.nodes if n.type == "BSDF_PRINCIPLED").inputs["Base Color"])
+    _mesh(coll, "Tank Floor", lambda bm: bmesh.ops.create_grid(bm, x_segments=1, y_segments=1, size=1.0),
+          (0, 0, 0.0), mat=tiles).scale = (1.25, 0.55, 1)
+    back = _mesh(coll, "Tank Back", lambda bm: bmesh.ops.create_grid(bm, x_segments=1, y_segments=1, size=1.0),
+                 (0, 0.52, 0.7), (math.radians(90), 0, 0), tank_mat)
+    back.scale = (1.25, 0.75, 1)
+    sun = bpy.data.lights.new("Nova Sun", "SUN")
+    sun.energy, sun.angle = 3.0, math.radians(2)
+    sun_ob = bpy.data.objects.new("Nova Sun", sun)
+    sun_ob.rotation_euler = (math.radians(50), 0, math.radians(-30))
+    coll.objects.link(sun_ob)
+    render.sync_liquid(s)
+    return s
+
+
 def build_empty(context, coll):
     s = new_system(context, coll, "Nova System", [
         dict(name="Particle", color_mode="BLACKBODY", temp0=2400, life_min=1, life_max=2, emit=20),
@@ -623,6 +691,8 @@ PRESETS = [
      build_lightning),
     ("FORMATION", "Particle Logo", "Dust assembles into a word (any text, logo or mesh), holds, then scatters",
      build_formation),
+    ("LIQUID", "Splash Tank", "FLIP liquid: a column of water falls around an obstacle and sloshes in a tank",
+     build_liquid),
     ("DISINTEGRATE", "Burn Away", "An object burns away along a ragged glowing front, shedding embers and ash",
      build_disintegrate),
     ("EMPTY", "Empty System", "One type, one emitter: start from scratch", build_empty),
@@ -657,6 +727,7 @@ STAGES = {
     "LIGHTNING": ((0, -95, 7), (0, 0, 23), 30, True),
     "FORMATION": ((0, -9, 1.3), (0, 0, 1.2), 35, True),
     "DISINTEGRATE": ((0, -4.2, 1.3), (0, 0, 1.15), 45, True),
+    "LIQUID": ((0.4, -3.6, 1.5), (0, 0, 0.35), 32, "DAY"),
     "EMPTY": ((0, -10, 3), (0, 0, 2), 35, False),
 }
 
@@ -707,8 +778,11 @@ def setup_stage(context, coll, key, offset):
     camera(context, coll, Vector(loc) + offset, Vector(target) + offset, lens)
     if key == "LIGHTNING":
         cloud_deck(coll, 42, 60).location += offset
-    if night == "DUSK":
+    if night == "DAY":
+        day_world(context)
+    elif night == "DUSK":
         night_world(context, (0.06, 0.07, 0.1))
     elif night:
         night_world(context)
-    render.setup_glow(context.scene)
+    if night != "DAY":
+        render.setup_glow(context.scene)

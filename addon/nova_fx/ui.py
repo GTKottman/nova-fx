@@ -212,8 +212,24 @@ class NOVA_PT_fluid(_Panel, bpy.types.Panel):
         layout.use_property_split = True
         layout.use_property_decorate = False
         layout.active = fl.enabled
+        layout.prop(fl, "mode", expand=True)
         layout.prop(fl, "domain")
         layout.prop(fl, "resolution")
+        if fl.mode == "LIQUID":
+            layout.prop(fl, "flip")
+            layout.prop(fl, "walls")
+            col = layout.column(align=True)
+            col.prop(fl, "surface_radius")
+            col.prop(fl, "surface_smooth")
+            if not any(k.liquid for k in _sys(context).nova.kinds):
+                layout.label(text="Mark a particle type as Liquid (Motion)", icon="ERROR")
+            header, body = layout.panel("nova_liquid_solver", default_closed=True)
+            header.label(text="Solver")
+            if body:
+                body.prop(fl, "cfl")
+                body.prop(fl, "max_sub")
+                body.prop(fl, "cg_tol")
+            return
         layout.prop(fl, "device", expand=True)
         if fl.domain:
             try:
