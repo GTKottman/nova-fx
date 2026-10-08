@@ -42,6 +42,7 @@ make -C core
 | Drifting Embers | Buoyant embers in wind |
 | Energy Vortex | Vortex + attractor forces, streak display |
 | Snow | Lit flakes that settle |
+| Particle Logo | Dust assembles into a word (any text, logo or mesh) with the Form force, holds, then scatters |
 | Lightning | Cloud-to-ground strike grown by the dielectric breakdown model: stepped leader, return strokes, cooling afterglow, impact spatter. With *Camera, World & Glow*, a cloud deck the flash lights from inside |
 | Empty System | Starting point |
 
@@ -264,6 +265,26 @@ A wide fire that fills ~40% of a 6.1M-cell domain: CPU sparse 862 ms, GPU dense 
 - **Example:** [`examples/lightning_storm.py`](examples/lightning_storm.py) is a storm with three strikes, one
   of them drawn to a lightning rod on a mast.
 
+### Shapes: logos, text and formations
+Any object Blender can turn into a mesh can be a shape: meshes, text (and MoBlend MoText), curves and
+imported SVG logos. Each object keeps its own sampling settings: *Surface*, *Outline* (the border: best for
+flat logos and text), *Edges* or *Vertices*, and a point count. Points are stored in up to 32 slots per
+system (`nv_sys_set_shape`) and re-sampled only when the object changes.
+- **Form force:** every particle gets its own point of the shape (a hash of its id) and a critically damped
+  spring pulls it there: a = ω²(target − x) − 2ζωv.
+  - *Pull* (0–1) blends gravity, wind, turbulence and the drags out, so a fully formed shape sits exactly on
+    its points. Keyframe it to assemble and release.
+  - *Snap* is ω: settled in about 6 / Snap seconds. *Damping* is ζ: 1 arrives without overshoot.
+  - The shape follows its object as it moves.
+  - Measured: 3000 particles settle on their points within 0.34 mm, with gravity and turbulence on.
+- **Shape burst** (death pattern *Shape*): firework stars fly out along the shape's points (turned like the
+  object, longest reach = 1). Linear drag stops each star at speed/drag along its direction, so the stars hang
+  in the shape. The size comes out ≈ burst speed / linear drag, a percent or two smaller from the stepping;
+  the shape itself is exact.
+- Forces can now be limited to one **System**. Leave it empty and every system feels the force, as before.
+- **Examples:** [`examples/particle_logo.py`](examples/particle_logo.py) (the preset) and
+  [`examples/logo_fireworks.py`](examples/logo_fireworks.py) (shells that burst into a word and a star).
+
 ### Music sync
 Emitters, lightning and any animatable property can follow a song: **Sidebar → Nova FX → Music**.
 - **Song:** an audio file (any format Blender plays), a MIDI file of the same song, or both. *Song Starts*
@@ -329,6 +350,7 @@ Same plume, empty domain grown from 64³ to 256³ (old → now):
 python3 tests/test_core.py                                     # core: correctness + speed, ~7 s
 blender -b --factory-startup --python tests/blender_presets.py -- --frames 24
 blender -b --factory-startup --python tests/blender_lightning.py   # bolt controls, target, timeline
+blender -b --factory-startup --python tests/blender_formation.py   # sampling, the logo forms, shaped shells
 python3 tests/test_music.py                                     # MIDI parsing, onset timing, ~1 s
 blender -b --factory-startup --python tests/blender_music.py       # shells burst on the beat, bolts, drives
 blender -b --factory-startup --python tests/blender_render.py -- FIREWORKS 260 out.png CYCLES 64

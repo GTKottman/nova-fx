@@ -15,7 +15,7 @@
   X(twinkle_freq, 0) X(twinkle_amt, 0)                                                    \
   X(collide, 1) X(bounce, 0.3) X(friction, 0.2)                                           \
   X(death_kind, -1) X(death_count, 0) X(death_pattern, 0) X(death_speed, 10)              \
-  X(death_speed_var, 0.15) X(death_inherit, 0.3)                                          \
+  X(death_speed_var, 0.15) X(death_inherit, 0.3) X(death_shape, -1)                       \
   X(trail_kind, -1) X(trail_rate, 0) X(trail_inherit, 0.2) X(trail_jitter, 0.3)           \
   X(split_kind, -1) X(split_rate, 0) X(split_count, 3) X(split_speed, 3)                  \
   X(split_inherit, 0.7) X(split_max_gen, 3)                                               \

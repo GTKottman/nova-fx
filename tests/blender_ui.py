@@ -99,12 +99,23 @@ def s_music():
     L("music synced", len(ob.nova_emitter.music.hits), "hits", sc.nova_music.info)
 def s_music_shot():
     shot("4_music")
+def s_formation():
+    w, a = area3d()
+    with bpy.context.temp_override(window=w, area=a):
+        bpy.ops.nova.add_preset(preset="FORMATION")
+    fw = bpy.data.objects["Fireworks"]
+    k = fw.nova.kinds["Shell Peony"]
+    k.death_pattern, k.death_shape = "SHAPE", bpy.data.objects["Logo Text"]
+    select(bpy.data.objects["Logo Form"])
+    L("formation added")
+def s_formation_shot():
+    shot("5_formation")
 def s_quit():
     L("done")
     log.close()
     bpy.ops.wm.quit_blender()
 
-seq = [setup, s_system, s_emitter, s_emitter_shot, s_fireworks, s_fw_shot, s_music, s_music_shot, s_quit]
+seq = [setup, s_system, s_emitter, s_emitter_shot, s_fireworks, s_fw_shot, s_music, s_music_shot, s_formation, s_formation_shot, s_quit]
 def tick():
     if not seq:
         return None

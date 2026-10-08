@@ -19,6 +19,8 @@ PATTERNS = [
     ("HEART", "Heart", "Heart shape in a vertical plane"),
     ("CONE", "Cone", "Spray around the direction of travel"),
     ("HEMI", "Upper Half", "Random over the upper hemisphere (fountains, splashes)"),
+    ("SHAPE", "Shape", "Burst into the shape of an object: a logo, text, any mesh or curve. With linear drag "
+                       "the stars stop exactly in the shape; its size = burst speed / linear drag"),
 ]
 COLLIDE = [
     ("NONE", "Pass Through", "Ignore colliders"),
@@ -28,7 +30,7 @@ COLLIDE = [
 ]
 
 # (name, type, default, options). Types: F float, I int, B bool, E enum, K particle-type reference,
-# C colour (maps to three C params). "group" decides the UI box.
+# C colour (maps to three C params), O object (resolved to a shape slot by the runtime). "group" decides the UI box.
 KIND_SPEC = [
     ("life_min", "F", 1.0, dict(min=0.001, soft_max=20, unit="TIME_ABSOLUTE", group="life", desc="Shortest lifetime")),
     ("life_max", "F", 2.0, dict(min=0.001, soft_max=20, unit="TIME_ABSOLUTE", group="life", desc="Longest lifetime")),
@@ -77,6 +79,8 @@ KIND_SPEC = [
     ("death_speed", "F", 10.0, dict(min=0, soft_max=100, unit="VELOCITY", group="death", desc="Burst speed")),
     ("death_speed_var", "F", 0.15, dict(min=0, max=1, group="death", desc="Burst speed variation")),
     ("death_inherit", "F", 0.3, dict(soft_min=0, soft_max=1, group="death", desc="Share of parent velocity children keep")),
+    ("death_shape", "O", None, dict(group="death", desc="Object whose shape the burst takes (Shape pattern), turned "
+                                                        "like the object")),
 
     ("trail_kind", "K", "", dict(group="trail", desc="Leave a trail of this type")),
     ("trail_rate", "F", 0.0, dict(min=0, soft_max=500, group="trail", desc="Trail particles per second")),
@@ -127,6 +131,8 @@ def pack_kind(kind, names):
             d[name] = names.index(v) if v in names else -1
         elif t == "B":
             d[name] = 1.0 if v else 0.0
+        elif t == "O":
+            d[name] = -1.0  # sim.apply_params fills in the shape slot
         else:
             d[name] = float(v)
     return d

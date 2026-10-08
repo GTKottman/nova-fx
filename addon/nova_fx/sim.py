@@ -10,7 +10,7 @@ import bpy
 import numpy as np
 from mathutils import Matrix, Vector
 
-from . import core, music_sync
+from . import core, music_sync, shapes
 from .params import pack_kind
 from .props import FLUID_BOOL_SPEC, FLUID_INT_SPEC, FLUID_SPEC
 
@@ -100,6 +100,9 @@ def apply_params(rt, scene, sysob):
     n = sysob.nova
     names = [k.name for k in n.kinds]
     kinds = [pack_kind(k, names) for k in n.kinds] or [{}]
+    for k, d in zip(n.kinds, kinds):
+        if k.death_pattern == "SHAPE" and k.death_shape is not None:
+            d["death_shape"] = ensure_shape(rt, k.death_shape, "burst")
     rt.sys.set_kinds(kinds)
     g, w = n.gravity, n.wind
     rt.sys.set_params(dict(gx=g[0], gy=g[1], gz=g[2], wx=w[0], wy=w[1], wz=w[2], turb_amp=n.turb_amp,
@@ -238,16 +241,45 @@ def collider_records(rt, scene, dt, depsgraph=None, frame=0):
     return recs
 
 
-def force_records(scene):
-    types = {"ATTRACT": 0, "VORTEX": 1, "WIND": 2, "TURBULENCE": 3, "DRAG": 4}
+def ensure_shape(rt, ob, purpose, depsgraph=None):
+    """Upload the object's sampled points to a shape slot (only when they change); returns the slot or -1.
+    purpose "form": world-space points; "burst": unit directions turned like the object."""
+    slots = rt.__dict__.setdefault("shape_slots", {})
+    keys = rt.__dict__.setdefault("shape_keys", {})
+    name = (ob.name, purpose)
+    if name not in slots:
+        if len(slots) >= 32:
+            return -1
+        slots[name] = len(slots)
+    slot = slots[name]
+    k = shapes.key(ob, purpose)
+    if keys.get(name) != k:
+        s = ob.nova_shape
+        pts = shapes.sample(ob, depsgraph or bpy.context.evaluated_depsgraph_get(), s.mode, s.points, s.seed)
+        pts = shapes.world(ob, pts) if purpose == "form" else shapes.burst(ob, pts)
+        rt.sys.set_shape(slot, pts)
+        keys[name] = k
+    return slot
+
+
+def force_records(rt, scene, depsgraph=None, sysob=None):
+    types = {"ATTRACT": 0, "VORTEX": 1, "WIND": 2, "TURBULENCE": 3, "DRAG": 4, "FORM": 5}
     recs = []
     for ob in scene.objects:
         f = ob.nova_force
-        if not f.enabled:
+        if not f.enabled or (f.system is not None and sysob is not None and f.system != sysob):
             continue
         mw = ob.matrix_world
         axis = (mw.to_3x3() @ Vector((0, 0, 1))).normalized()
-        recs.append([types[f.type], *mw.to_translation(), *axis, f.strength, f.radius, f.freq, f.falloff])
+        if f.type == "FORM":
+            target = f.target or ob
+            if target.type not in {"MESH", "CURVE", "FONT", "SURFACE", "META", "CURVES"}:
+                continue
+            slot = ensure_shape(rt, target, "form", depsgraph)
+            if slot >= 0:
+                recs.append([5, *mw.to_translation(), *axis, f.pull, 0.0, f.snap, f.damping, slot])
+            continue
+        recs.append([types[f.type], *mw.to_translation(), *axis, f.strength, f.radius, f.freq, f.falloff, 0])
     return recs
 
 
@@ -481,13 +513,13 @@ def step(scene, sysob, frame, depsgraph=None, write=True):
         reset(rt, scene, sysob)
         apply_params(rt, scene, sysob)
         rt.sys.set_colliders(collider_records(rt, scene, dt, depsgraph, frame))
-        rt.sys.set_forces(force_records(scene))
+        rt.sys.set_forces(force_records(rt, scene, depsgraph, sysob))
         emit_frame(rt, scene, sysob, frame, dt, depsgraph)
     else:
         ensure_fluid(rt, sysob)
         apply_params(rt, scene, sysob)
         rt.sys.set_colliders(collider_records(rt, scene, dt, depsgraph, frame))
-        rt.sys.set_forces(force_records(scene))
+        rt.sys.set_forces(force_records(rt, scene, depsgraph, sysob))
         # sources first (they feed this frame's fluid step), then move, then the new births
         rt.sys.frame(dt, n.substeps, rt.fluid)
         emit_frame(rt, scene, sysob, frame, dt, depsgraph)

@@ -324,10 +324,18 @@ typedef struct {
 } Collider;
 
 typedef struct {
-  int type; /* 0 attract, 1 vortex, 2 wind, 3 turbulence, 4 drag */
+  int type; /* 0 attract, 1 vortex, 2 wind, 3 turbulence, 4 drag, 5 form (spring to a point of shape `slot`) */
   float pos[3], axis[3];
   float strength, radius, freq, falloff;
+  int slot;
 } Force;
+
+/* A point set: a shape that particles form (world space) or burst into (unit size, oriented). */
+#define MAXSHAPE 32
+typedef struct {
+  float *p;
+  int n;
+} Shape;
 
 typedef struct NvFluid {
   int nx, ny, nz;
@@ -1947,6 +1955,7 @@ typedef struct NvSys {
   float *dep_pos, *dep_amt;
   int dep_cap;
   Sdf sdf[MAXSDF];
+  Shape shape[MAXSHAPE];
   /* turbulence baked on a grid around the particles (used when far cheaper than per-particle noise) */
   float *tg;
   size_t tg_cap;
@@ -2037,6 +2046,7 @@ API void nv_sys_free(NvSys *s) {
   free(s->ev_trail); free(s->ev_death); free(s->ev_split); free(s->ev_hit); free(s->dead);
   free(s->cnt); free(s->off); free(s->dep_pos); free(s->dep_amt);
   for (int i = 0; i < MAXSDF; i++) free(s->sdf[i].d);
+  for (int i = 0; i < MAXSHAPE; i++) free(s->shape[i].p);
   free(s->tg);
   free(s);
 }
@@ -2137,10 +2147,31 @@ API int nv_sys_set_sdf(NvSys *s, int slot, int nx, int ny, int nz, float ox, flo
 }
 
 /* force record: type, pos[3], axis[3], strength, radius, freq, falloff = 11 floats */
+/* Store a point set in `slot` (copied). n = 0 clears it. Returns 1 on success. */
+API int nv_sys_set_shape(NvSys *s, int slot, int n, const float *pts) {
+  if (slot < 0 || slot >= MAXSHAPE) return 0;
+  Shape *S = &s->shape[slot];
+  if (n <= 0) {
+    S->n = 0;
+    return 1;
+  }
+  float *p = (float *)realloc(S->p, sizeof(float) * 3 * (size_t)n);
+  if (!p) return 0;
+  memcpy(p, pts, sizeof(float) * 3 * (size_t)n);
+  S->p = p;
+  S->n = n;
+  return 1;
+}
+
+static inline const Shape *shape_at(const NvSys *s, float slot) {
+  int k = (int)slot;
+  return (slot >= 0.f && k < MAXSHAPE && s->shape[k].n > 0) ? &s->shape[k] : NULL;
+}
+
 API void nv_sys_set_forces(NvSys *s, int n, const float *d) {
   s->nfrc = n > MAXFRC ? MAXFRC : n;
   for (int c = 0; c < s->nfrc; c++) {
-    const float *r = d + c * 11;
+    const float *r = d + c * 12;
     Force *F = &s->frc[c];
     F->type = (int)r[0];
     memcpy(F->pos, r + 1, 12);
@@ -2149,6 +2180,7 @@ API void nv_sys_set_forces(NvSys *s, int n, const float *d) {
     F->radius = r[8];
     F->freq = r[9];
     F->falloff = r[10];
+    F->slot = (int)r[11];
   }
 }
 
@@ -2648,8 +2680,23 @@ API void nv_sys_step(NvSys *s, float dt) {
       ax += c[0] * tk; ay += c[1] * tk; az += c[2] * tk;
     }
     float fk = K[KP_force];
+    /* form: a critically damped spring to this particle's own point of the shape. It blends the other
+     * accelerations and the drags out by its pull, so a fully formed shape sits exactly on its points */
+    float fw = 0.f, fax = 0.f, fay = 0.f, faz = 0.f;
     for (int q = 0; q < s->nfrc && fk != 0.f; q++) {
       const Force *F = &s->frc[q];
+      if (F->type == 5) {
+        const Shape *S = shape_at(s, (float)F->slot);
+        float w = clampf(F->strength, 0.f, 1.f) * clampf(fk, 0.f, 1.f);
+        if (!S || w <= 0.f) continue;
+        const float *T = S->p + 3 * (size_t)(h3(id, (uint32_t)F->slot, 0xF02Du) % (uint32_t)S->n);
+        float om = F->freq, zt = F->falloff; /* snap (1/s), damping ratio */
+        fax += w * (om * om * (T[0] - x) - 2.f * zt * om * vx);
+        fay += w * (om * om * (T[1] - y) - 2.f * zt * om * vy);
+        faz += w * (om * om * (T[2] - z) - 2.f * zt * om * vz);
+        fw += w;
+        continue;
+      }
       float dxp = x - F->pos[0], dyp = y - F->pos[1], dzp = z - F->pos[2];
       float d2 = dxp * dxp + dyp * dyp + dzp * dzp, d = sqrtf(d2) + 1e-6f;
       float fall = 1.f;
@@ -2680,8 +2727,13 @@ API void nv_sys_step(NvSys *s, float dt) {
         vx *= e; vy *= e; vz *= e;
       }
     }
+    if (fw > 0.f) {
+      float keep = fw < 1.f ? 1.f - fw : 0.f, sc = fw > 1.f ? 1.f / fw : 1.f;
+      ax = ax * keep + fax * sc; ay = ay * keep + fay * sc; az = az * keep + faz * sc;
+      fw = fw > 1.f ? 1.f : fw;
+    }
     vx += ax * dt; vy += ay * dt; vz += az * dt;
-    float fd = K[KP_fluid_drag];
+    float fd = K[KP_fluid_drag] * (1.f - fw);
     if (fl && fd > 0.f) {
       float inv = 1.f / fl->dx;
       float gx = (x - fl->o[0]) * inv, gy = (y - fl->o[1]) * inv, gz = (z - fl->o[2]) * inv;
@@ -2692,12 +2744,12 @@ API void nv_sys_step(NvSys *s, float dt) {
         vx += (uf[0] - vx) * c; vy += (uf[1] - vy) * c; vz += (uf[2] - vz) * c;
       }
     }
-    float dl = K[KP_drag_lin];
+    float dl = K[KP_drag_lin] * (1.f - fw);
     if (dl > 0.f) {
       float e = expf(-dl * dt);
       vx = airx + (vx - airx) * e; vy = airy + (vy - airy) * e; vz = airz + (vz - airz) * e;
     }
-    float dq = K[KP_drag_quad];
+    float dq = K[KP_drag_quad] * (1.f - fw);
     if (dq > 0.f) {
       float rx = vx - airx, ry = vy - airy, rz = vz - airz;
       float sp = sqrtf(rx * rx + ry * ry + rz * rz);
@@ -2870,9 +2922,16 @@ API void nv_sys_step(NvSys *s, float dt) {
         for (int k = 0; k < 3; k++) cv[k] = pv[k] * K[KP_split_inherit] + r[k] * spd;
         init_particle(s, &s->q, (int)o, (int)K[KP_split_kind], pos, cv, rgb, gen, id0 + o);
       }
+      const Shape *DS = (int)K[KP_death_pattern] == 8 ? shape_at(s, K[KP_death_shape]) : NULL;
       for (int j = 0; j < nd && o < (uint32_t)nq; j++, o++) {
         float d[3], cv[3];
-        pattern_dir((int)K[KP_death_pattern], j, nd, pid, sd, pv, d);
+        if (DS) {
+          /* stratified pick from the (pre-shuffled) points: an even sample of the shape at any count */
+          const float *T = DS->p + 3 * (size_t)(((uint64_t)j * (uint64_t)DS->n) / (uint64_t)nd);
+          d[0] = T[0]; d[1] = T[1]; d[2] = T[2];
+        } else {
+          pattern_dir((int)K[KP_death_pattern], j, nd, pid, sd, pv, d);
+        }
         uint32_t h = h3(pid, (uint32_t)j, sd ^ 0xD4u);
         float spd = K[KP_death_speed] * (1.f + K[KP_death_speed_var] * (2.f * u01(h) - 1.f));
         for (int k = 0; k < 3; k++) cv[k] = pv[k] * K[KP_death_inherit] + d[k] * spd;
