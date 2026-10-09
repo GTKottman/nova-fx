@@ -54,7 +54,7 @@ co = np.empty(nv * 3, np.float32)
 me.vertices.foreach_get("co", co)
 co = co.reshape(-1, 3)
 fl.surface.evaluated_get(dg).to_mesh_clear()
-check(nv > 2000 and co[:, 2].min() > -0.05 and co[:, 2].max() < 1.4, f"surface mesh: {nv} vertices")
+check(nv > 2000 and co[:, 2].min() >= lo[2] - 1e-4 and co[:, 2].max() < 1.4, f"surface mesh: {nv} vertices, z {co[:, 2].min():.3f}..{co[:, 2].max():.3f}")
 slow = [(i + 1, round(t, 2)) for i, t in enumerate(times) if t > 0.5]
 print("slow frames", slow)
 print(f"liquid: median {np.median(times) * 1000:.0f} ms/frame, max {max(times) * 1000:.0f} ms")

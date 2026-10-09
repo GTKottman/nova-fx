@@ -47,8 +47,18 @@ KIND_SPEC = [
     ("wind", "F", 1.0, dict(soft_min=0, soft_max=2, group="motion", desc="How much the system wind applies")),
     ("force", "F", 1.0, dict(soft_min=0, soft_max=5, group="motion", desc="How strongly force objects act on this type")),
     ("fluid_drag", "F", 0.0, dict(min=0, soft_max=20, group="motion", desc="Ride the fluid: pull toward the fluid velocity (1/s)")),
-    ("liquid", "B", False, dict(group="motion", desc="Part of a liquid: the liquid solver moves it (Fire & Smoke in Liquid "
+    ("liquid", "B", False, dict(group="liquid", desc="Part of a liquid: the liquid solver moves it (Fire & Smoke in Liquid "
                                                      "mode). Give it a long life")),
+    ("viscosity", "F", 0.0, dict(min=0, soft_max=500, group="liquid",
+                                 desc="Dynamic viscosity in Pa·s: water 0.001, blood 0.004, syrup 3, honey 10, "
+                                      "chocolate 25, slime 200. Thick liquids buckle and coil when poured")),
+    ("visc_temp", "F", 0.0, dict(soft_min=0, soft_max=50, group="liquid",
+                                 desc="How much heat thins it: viscosity × e^(this × (Temp - T) / 1000 K). Lava and "
+                                      "melting wax: hot runs, cold sets")),
+    ("conduct", "F", 0.0, dict(min=0, soft_max=20, group="liquid",
+                               desc="Heat spreading between neighbours (1/s): a heated spot warms the rest")),
+    ("crust", "F", 0.0, dict(min=0, soft_max=20, group="liquid",
+                             desc="Cooling at the surface only (1/s): lava grows a dark, stiff skin")),
 
     ("color_mode", "E", "FIXED", dict(items=COLOR_MODES, group="color", desc="How colour is decided")),
     ("color", "C", (1.0, 0.6, 0.2), dict(group="color", desc="Colour (start colour for Gradient)")),
@@ -110,6 +120,7 @@ KIND_GROUPS = [
     ("trail", "Trail", "CURVE_PATH"),
     ("split", "Split / Branch", "OUTLINER_DATA_LIGHTPROBE"),
     ("fluid", "Feed the Fluid", "MOD_FLUIDSIM"),
+    ("liquid", "Liquid", "MOD_FLUIDSIM"),
 ]
 
 ENUM_INDEX = {

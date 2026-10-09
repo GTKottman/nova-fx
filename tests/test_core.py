@@ -364,6 +364,83 @@ def test_liquid_dam_break():
     print("liquid repeats exactly run to run")
 
 
+
+def _blob_L(mu, frames=6, omega=4.0):
+    f = core.Fluid((40, 40, 40), 0.02, (-0.4, -0.4, -0.4))
+    f.set_params(dict(liquid=1, flip=0.95, walls=0, closed_floor=0, cfl=1.0, max_sub=8))
+    s = core.System(); s.set_params(dict(gz=0.0))
+    s.set_kinds([dict(liquid=1, life_min=1e6, life_max=1e6, collide=0, viscosity=mu)]); s.set_fluid(f)
+    rng = np.random.default_rng(0)
+    P = rng.uniform(-0.15, 0.15, (200000, 3)); P = P[np.linalg.norm(P, axis=1) < 0.15]
+    V = np.stack([-omega * P[:, 1], omega * P[:, 0], np.zeros(len(P))], 1)
+    s.emit(0, P, V)
+    for _ in range(frames):
+        s.frame(1 / 24, 1, f)
+    P2, V2, *_ = s.export()
+    V2 = V2.astype(np.float64); c = P2.mean(0)
+    L = ((P2[:, 0] - c[0]) * V2[:, 1] - (P2[:, 1] - c[1]) * V2[:, 0]).sum()
+    return L / (P[:, 0] * V[:, 1] - P[:, 1] * V[:, 0]).sum()
+
+
+def test_viscosity_rotation():
+    """Rigid rotation has no strain: viscosity must not stop a spinning blob (the free surface is stress-free)."""
+    free, thick = _blob_L(0.0), _blob_L(500.0)
+    assert thick > free - 0.1, (free, thick)
+    print(f"viscous spin: angular momentum kept {thick:.2f} at 500 Pa·s vs {free:.2f} inviscid")
+
+
+def _spread(mu, frames=12, **kind):
+    f = core.Fluid((60, 12, 30), 0.02, (0, 0, 0))
+    f.set_params(dict(liquid=1, flip=0.1 if mu else 0.95, walls=1, closed_floor=1, cfl=1.0, max_sub=8))
+    s = core.System(); s.set_kinds([dict(liquid=1, life_min=1e6, life_max=1e6, collide=0, viscosity=mu, **kind)])
+    s.set_fluid(f)
+    rng = np.random.default_rng(1)
+    P = rng.uniform([0.02, 0.02, 0.02], [0.22, 0.22, 0.32], (60000, 3))
+    s.emit(0, P, np.zeros_like(P))
+    for _ in range(frames):
+        s.frame(1 / 24, 1, f)
+    return np.percentile(s.export()[0][:, 0], 99), s, f
+
+
+def test_viscosity_spreading_and_melting():
+    water, honey, tar = (_spread(mu)[0] for mu in (0.0, 5.0, 50.0))
+    assert water > honey > tar, (water, honey, tar)
+    # a block too thick to flow (frozen) stays put; warmed by a heat source it runs
+    cold, s, f = _spread(1e6, temp0=300, temp_var=0, visc_temp=60, cool=0)
+    assert cold < 0.23, cold
+    s.set_forces([[6, 0.1, 0.1, 0.2, 0, 0, 1, 700.0, 0.0, 3.0, 0.0, 0]])  # heat everything toward 700 K
+    for _ in range(24):
+        s.frame(1 / 24, 1, f)
+    warm = np.percentile(s.export()[0][:, 0], 99)
+    assert warm > cold + 0.1, (cold, warm)
+    print(f"viscous spreading after 0.5 s: front {water:.2f} m water, {honey:.2f} at 5 Pa·s, {tar:.2f} at 50; "
+          f"a frozen block stays at {cold:.2f}, heated it runs to {warm:.2f}")
+
+
+def test_nozzle_stream():
+    """A thick stream from a nozzle stays one piece: the falling rope cannot pull the nozzle faster."""
+    dx, r, v0 = 0.004, 0.008, 0.25
+    f = core.Fluid((24, 24, 60), dx, (-0.048, -0.048, 0))
+    f.set_params(dict(liquid=1, flip=0.3, walls=1, closed_floor=1, cfl=3.0, max_sub=16, visc_couple=2))
+    s = core.System(); s.set_kinds([dict(liquid=1, life_min=1e6, life_max=1e6, collide=0, viscosity=50.0)])
+    s.set_fluid(f)
+    z0 = 0.22
+    s.set_inflows([(0, 0, z0, r * 1.6, 0, 0, -v0)])
+    rng = np.random.default_rng(0)
+    rate, carry = np.pi * r * r * v0 / dx ** 3 * 8, 0.0
+    for fr in range(24):
+        n = rate / 24 + carry; k = int(n); carry = n - k
+        a = rng.uniform(0, 2 * np.pi, k); rr = r * np.sqrt(rng.uniform(0, 1, k))
+        P = np.stack([rr * np.cos(a), rr * np.sin(a), z0 + rng.uniform(0, v0 / 24, k)], 1)
+        s.emit(0, P, np.tile([0, 0, -v0], (k, 1)), rng.uniform(0, 1 / 24, k).astype(np.float32))
+        s.frame(1 / 24, 1, f)
+    z = s.export()[0][:, 2]
+    top = z.max()
+    h, _ = np.histogram(z[z > top - 0.1], bins=np.arange(top - 0.1, top + 1e-6, 0.008))
+    assert (h > 0).all(), h
+    print(f"nozzle stream: continuous over the top 10 cm ({h.min()}-{h.max()} particles per 8 mm)")
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and (len(sys.argv) < 2 or name in sys.argv[1:]):

@@ -363,6 +363,7 @@ typedef struct NvFluid {
   float *t_max;                /* GPU: per-candidate content maxima read back for the tile scan */
   int vox_pending, vox_box[6]; /* cells to re-voxelize against the colliders */
   GpuFluid *gpu;               /* non-NULL: the solver runs on the GPU, CPU arrays are download targets */
+  float lq_rest;               /* liquid: particles per full cell when it first appeared (its rest density) */
   int hier_ver, gpu_hier_ver;
   int hier_inc; /* the last hierarchy update was incremental (only the blocks in each level's slist changed) */
 } NvFluid;
@@ -479,6 +480,7 @@ static void refresh(float **a, size_t n) {
 }
 
 API void nv_fluid_reset(NvFluid *f) {
+  f->lq_rest = 0.f;
   refresh(&f->u, f->nu); refresh(&f->v, f->nv); refresh(&f->w, f->nw);
   refresh(&f->u0, f->nu); refresh(&f->v0, f->nv); refresh(&f->w0, f->nw);
   refresh(&f->u1, f->nu); refresh(&f->v1, f->nv); refresh(&f->w1, f->nw);
@@ -1956,6 +1958,8 @@ typedef struct NvSys {
   int dep_cap;
   Sdf sdf[MAXSDF];
   Shape shape[MAXSHAPE];
+  float inflow[16][7]; /* liquid nozzles: centre, radius, velocity. Liquid inside moves at the nozzle's velocity */
+  int ninflow;
   /* turbulence baked on a grid around the particles (used when far cheaper than per-particle noise) */
   float *tg;
   size_t tg_cap;
@@ -2147,6 +2151,13 @@ API int nv_sys_set_sdf(NvSys *s, int slot, int nx, int ny, int nz, float ox, flo
 }
 
 /* force record: type, pos[3], axis[3], strength, radius, freq, falloff = 11 floats */
+/* Liquid inflows (nozzles): n records of [cx, cy, cz, radius, vx, vy, vz]. A real nozzle is fed by a reservoir:
+ * the stream below can pull on it (viscous tension) but cannot speed it up. */
+API void nv_sys_set_inflows(NvSys *s, int n, const float *d) {
+  s->ninflow = n < 0 ? 0 : (n > 16 ? 16 : n);
+  if (s->ninflow) memcpy(s->inflow, d, sizeof(float) * 7 * (size_t)s->ninflow);
+}
+
 /* Store a point set in `slot` (copied). n = 0 clears it. Returns 1 on success. */
 API int nv_sys_set_shape(NvSys *s, int slot, int n, const float *pts) {
   if (slot < 0 || slot >= MAXSHAPE) return 0;
@@ -2819,6 +2830,17 @@ API void nv_sys_step(NvSys *s, float dt) {
     /* temperature: Newton + radiative cooling toward ambient */
     float T = P->temp[i];
     T = Ta + (T - Ta) * expf(-K[KP_cool] * dt);
+    for (int q = 0; q < s->nfrc; q++) { /* heat sources pull temperature toward their own */
+      const Force *F = &s->frc[q];
+      if (F->type != 6) continue;
+      float dxp = P->x[i] - F->pos[0], dyp = P->y[i] - F->pos[1], dzp = P->z[i] - F->pos[2];
+      float d = sqrtf(dxp * dxp + dyp * dyp + dzp * dzp), fall = 1.f;
+      if (F->radius > 0.f) {
+        float q2 = d / F->radius;
+        fall = F->falloff > 0.f ? powf(1.f + q2 * q2, -0.5f * F->falloff) : (q2 < 1.f ? 1.f : 0.f);
+      }
+      T += (F->strength - T) * (1.f - expf(-F->freq * fall * dt));
+    }
     float crd = K[KP_cool_rad] * 1e-10f;
     if (crd > 0.f && T > Ta) T = Ta + (T - Ta) / cbrtf(1.f + 3.f * crd * (T - Ta) * (T - Ta) * (T - Ta) * dt);
     P->temp[i] = T;
@@ -3085,6 +3107,368 @@ static void lq_extrapolate(float *A, uint8_t *valid, uint8_t *tmpm, int sx, int 
   }
 }
 
+/* viscosity of one particle: the type's, thinned by heat. Above LQ_FROZEN it is a solid (it does not move);
+ * the solve itself caps at LQ_VCAP so the CG stays fast, frozen particles hold themselves */
+#define LQ_FROZEN 1e4f
+#define LQ_VCAP 1e3f
+static inline float lq_mu(const float *K, float T) {
+  float mu = K[KP_viscosity];
+  if (mu > 0.f && K[KP_visc_temp] != 0.f) /* hotter = runnier, relative to the type's birth temperature */
+    mu *= expf(clampf(K[KP_visc_temp] * (K[KP_temp0] - T) * 1e-3f, -20.f, 20.f));
+  return mu;
+}
+
+/* ---- viscosity: Batty & Bridson 2008, "Accurate viscous free surfaces for buckling, coiling and rotating
+ * liquids". One implicit solve per substep minimises
+ *     sum_faces rho V_f (u - u*)^2 / 2  +  dt sum mu V |D(u)|^2,     D = (grad u + grad u^T) / 2
+ * with control-volume weights V (liquid fractions): the weights vanish in the air, which makes the free
+ * surface stress-free with no explicit boundary condition, and that is what lets a falling stream buckle and
+ * coil. Solid cells count as full in the edge weights, so walls are no-slip. Strain lives where the MAC grid
+ * puts it: normal strain at cell centres, shear strain on cell edges. Matrix-free CG with a Jacobi
+ * preconditioner over the faces that hold liquid; the others keep their (extrapolated) values. */
+typedef struct {
+  float *frac, *mu, *wc;           /* per cell: liquid fraction, viscosity, edge weight (liquid + solid) */
+  float *sxx, *syy, *szz, *txy, *txz, *tyz;
+  float *x, *p; /* full face layout [U | V | W]: the velocity being solved, the CG direction */
+  size_t nc, nf, ne;
+  int iters;
+  float res;
+} VisBuf;
+static VisBuf g_vb;
+
+static void vb_reserve(const NvFluid *f) {
+  size_t nc = f->nc, nf = f->nu + f->nv + f->nw;
+  size_t ne = (size_t)(f->nx + 1) * (f->ny + 1) * (f->nz + 1);
+  if (nc > g_vb.nc) {
+    g_vb.nc = nc;
+    g_vb.frac = (float *)realloc(g_vb.frac, 4 * nc); g_vb.mu = (float *)realloc(g_vb.mu, 4 * nc);
+    g_vb.wc = (float *)realloc(g_vb.wc, 4 * nc);
+    g_vb.sxx = (float *)realloc(g_vb.sxx, 4 * nc); g_vb.syy = (float *)realloc(g_vb.syy, 4 * nc);
+    g_vb.szz = (float *)realloc(g_vb.szz, 4 * nc);
+  }
+  if (ne > g_vb.ne) {
+    g_vb.ne = ne;
+    g_vb.txy = (float *)realloc(g_vb.txy, 4 * ne); g_vb.txz = (float *)realloc(g_vb.txz, 4 * ne);
+    g_vb.tyz = (float *)realloc(g_vb.tyz, 4 * ne);
+  }
+  if (nf > g_vb.nf) {
+    g_vb.nf = nf;
+    g_vb.x = (float *)realloc(g_vb.x, 4 * nf);
+    g_vb.p = (float *)realloc(g_vb.p, 4 * nf);
+  }
+}
+
+/* edge index helpers: an edge array is sized (nx+1)(ny+1)(nz+1) for simplicity */
+#define EI(f, i, j, k) ((size_t)(i) + (size_t)((f)->nx + 1) * ((size_t)(j) + (size_t)((f)->ny + 1) * (size_t)(k)))
+
+static inline float vb_cell(const NvFluid *f, const float *a, int i, int j, int k) {
+  if (i < 0 || j < 0 || k < 0 || i >= f->nx || j >= f->ny || k >= f->nz) return 0.f;
+  return a[CI(f, i, j, k)];
+}
+
+/* viscosity x weight of the shear edges (mean of the four cells around each edge); 0 at the domain border */
+static inline float vb_exy(const NvFluid *f, int i, int j, int k) {
+  if (i <= 0 || j <= 0 || i >= f->nx || j >= f->ny || k < 0 || k >= f->nz) return 0.f;
+  float w = vb_cell(f, g_vb.wc, i - 1, j - 1, k) + vb_cell(f, g_vb.wc, i, j - 1, k) + vb_cell(f, g_vb.wc, i - 1, j, k) +
+            vb_cell(f, g_vb.wc, i, j, k);
+  float m = vb_cell(f, g_vb.mu, i - 1, j - 1, k) + vb_cell(f, g_vb.mu, i, j - 1, k) + vb_cell(f, g_vb.mu, i - 1, j, k) +
+            vb_cell(f, g_vb.mu, i, j, k);
+  return 0.0625f * w * m;
+}
+static inline float vb_exz(const NvFluid *f, int i, int j, int k) {
+  if (i <= 0 || k <= 0 || i >= f->nx || k >= f->nz || j < 0 || j >= f->ny) return 0.f;
+  float w = vb_cell(f, g_vb.wc, i - 1, j, k - 1) + vb_cell(f, g_vb.wc, i, j, k - 1) + vb_cell(f, g_vb.wc, i - 1, j, k) +
+            vb_cell(f, g_vb.wc, i, j, k);
+  float m = vb_cell(f, g_vb.mu, i - 1, j, k - 1) + vb_cell(f, g_vb.mu, i, j, k - 1) + vb_cell(f, g_vb.mu, i - 1, j, k) +
+            vb_cell(f, g_vb.mu, i, j, k);
+  return 0.0625f * w * m;
+}
+static inline float vb_eyz(const NvFluid *f, int i, int j, int k) {
+  if (j <= 0 || k <= 0 || j >= f->ny || k >= f->nz || i < 0 || i >= f->nx) return 0.f;
+  float w = vb_cell(f, g_vb.wc, i, j - 1, k - 1) + vb_cell(f, g_vb.wc, i, j, k - 1) + vb_cell(f, g_vb.wc, i, j - 1, k) +
+            vb_cell(f, g_vb.wc, i, j, k);
+  float m = vb_cell(f, g_vb.mu, i, j - 1, k - 1) + vb_cell(f, g_vb.mu, i, j, k - 1) + vb_cell(f, g_vb.mu, i, j - 1, k) +
+            vb_cell(f, g_vb.mu, i, j, k);
+  return 0.0625f * w * m;
+}
+
+/* the solve only visits a box around the liquid (cells [b0,b1) x [b2,b3) x [b4,b5)) and a compact list of
+ * unknown faces: cost follows the honey, not the domain */
+static int g_vbox[6];
+typedef struct { int g, comp, i, j, k; } VFace;
+static VFace *g_vf;
+static float *g_vm, *g_vdg, *g_vx, *g_vr, *g_vz, *g_vp, *g_vq; /* compact vectors */
+static int g_vcap;
+
+/* stresses (already divided by dx) from the face velocities x = [U|V|W] (full layout) */
+static void vb_stress(const NvFluid *f, const float *x, int big) {
+  const int *b = g_vbox;
+  const float inv = 1.f / f->dx;
+  const float *U = x, *V = x + f->nu, *W = x + f->nu + f->nv;
+  const float *mu = g_vb.mu, *fr = g_vb.frac;
+#pragma omp parallel for schedule(static) if (big)
+  for (int k = b[4]; k < b[5]; k++)
+    for (int j = b[2]; j < b[3]; j++)
+      for (int i = b[0]; i < b[1]; i++) {
+        size_t c = CI(f, i, j, k);
+        float w = 2.f * mu[c] * fr[c] * inv * inv;
+        g_vb.sxx[c] = w * (U[UI(f, i + 1, j, k)] - U[UI(f, i, j, k)]);
+        g_vb.syy[c] = w * (V[VI(f, i, j + 1, k)] - V[VI(f, i, j, k)]);
+        g_vb.szz[c] = w * (W[WI(f, i, j, k + 1)] - W[WI(f, i, j, k)]);
+      }
+#pragma omp parallel for schedule(static) if (big)
+  for (int k = b[4]; k <= b[5]; k++)
+    for (int j = b[2]; j <= b[3]; j++)
+      for (int i = b[0]; i <= b[1]; i++) {
+        size_t e = EI(f, i, j, k);
+        float txy = 0.f, txz = 0.f, tyz = 0.f, w;
+        if ((w = vb_exy(f, i, j, k)) > 0.f)
+          txy = 2.f * w * inv * inv * 0.5f *
+                ((U[UI(f, i, j, k)] - U[UI(f, i, j - 1, k)]) + (V[VI(f, i, j, k)] - V[VI(f, i - 1, j, k)]));
+        if ((w = vb_exz(f, i, j, k)) > 0.f)
+          txz = 2.f * w * inv * inv * 0.5f *
+                ((U[UI(f, i, j, k)] - U[UI(f, i, j, k - 1)]) + (W[WI(f, i, j, k)] - W[WI(f, i - 1, j, k)]));
+        if ((w = vb_eyz(f, i, j, k)) > 0.f)
+          tyz = 2.f * w * inv * inv * 0.5f *
+                ((V[VI(f, i, j, k)] - V[VI(f, i, j, k - 1)]) + (W[WI(f, i, j, k)] - W[WI(f, i, j - 1, k)]));
+        g_vb.txy[e] = txy; g_vb.txz[e] = txz; g_vb.tyz[e] = tyz;
+      }
+}
+
+static inline float vb_cs(const NvFluid *f, const float *a, int i, int j, int k) {
+  const int *b = g_vbox; /* outside the box the stresses were not computed: they are zero there anyway */
+  if (i < b[0] || j < b[2] || k < b[4] || i >= b[1] || j >= b[3] || k >= b[5]) return 0.f;
+  return a[CI(f, i, j, k)];
+}
+static inline float vb_es(const NvFluid *f, const float *a, int i, int j, int k) {
+  const int *b = g_vbox;
+  if (i < b[0] || j < b[2] || k < b[4] || i > b[1] || j > b[3] || k > b[5]) return 0.f;
+  return a[EI(f, i, j, k)];
+}
+
+/* y[n] = (rho m x + dt gradQ x) at the n-th unknown face; x in the full layout */
+static void vb_apply(const NvFluid *f, const float *x, float *y, int nfree, float dt, float rho, int big) {
+  vb_stress(f, x, big);
+  const float *sxx = g_vb.sxx, *syy = g_vb.syy, *szz = g_vb.szz, *txy = g_vb.txy, *txz = g_vb.txz, *tyz = g_vb.tyz;
+#pragma omp parallel for schedule(static) if (big)
+  for (int n = 0; n < nfree; n++) {
+    const VFace *F = &g_vf[n];
+    int i = F->i, j = F->j, k = F->k;
+    float g;
+    if (F->comp == 0)
+      g = vb_cs(f, sxx, i - 1, j, k) - vb_cs(f, sxx, i, j, k) + vb_es(f, txy, i, j, k) - vb_es(f, txy, i, j + 1, k) +
+          vb_es(f, txz, i, j, k) - vb_es(f, txz, i, j, k + 1);
+    else if (F->comp == 1)
+      g = vb_cs(f, syy, i, j - 1, k) - vb_cs(f, syy, i, j, k) + vb_es(f, txy, i, j, k) - vb_es(f, txy, i + 1, j, k) +
+          vb_es(f, tyz, i, j, k) - vb_es(f, tyz, i, j, k + 1);
+    else
+      g = vb_cs(f, szz, i, j, k - 1) - vb_cs(f, szz, i, j, k) + vb_es(f, txz, i, j, k) - vb_es(f, txz, i + 1, j, k) +
+          vb_es(f, tyz, i, j, k) - vb_es(f, tyz, i, j + 1, k);
+    y[n] = rho * g_vm[n] * x[F->g] + dt * g;
+  }
+}
+
+static double vb_dot(const float *a, const float *b, int n, int big) {
+  double s = 0;
+#pragma omp parallel for schedule(static) reduction(+ : s) if (big)
+  for (int q = 0; q < n; q++) s += (double)a[q] * b[q];
+  return s;
+}
+
+/* returns CG iterations; 0 when nothing in the liquid is viscous */
+static int lq_viscosity(NvSys *s, NvFluid *f, float h, int big) {
+  vb_reserve(f);
+  const int nx = f->nx, ny = f->ny, nz = f->nz;
+  const PB *P = &s->p;
+  float mumax = 0.f;
+  int lo[3] = {nx, ny, nz}, hi[3] = {-1, -1, -1};
+  /* per cell: liquid fraction from the particle count, viscosity averaged over the particles in it */
+  for (int k = 0; k < nz; k++)
+    for (int j = 0; j < ny; j++)
+      for (int i = 0; i < nx; i++) {
+        size_t c = CI(f, i, j, k);
+        int a0 = g_lq.start[c], a1 = g_lq.start[c + 1], cnt = a1 - a0;
+        float m = 0.f;
+        for (int a = a0; a < a1; a++) {
+          int p = g_lq.order[a];
+          float mu = lq_mu(s->kp[P->kind[p]], P->temp[p]);
+          m += mu < LQ_VCAP ? mu : LQ_VCAP;
+        }
+        int liquid = f->ctype[c] == 0;
+        g_vb.frac[c] = liquid ? fminf(1.f, cnt / 2.f) : 0.f;
+        g_vb.mu[c] = cnt ? m / cnt : 0.f;
+        g_vb.wc[c] = f->solid[c] ? 1.f : g_vb.frac[c];
+        if (g_vb.mu[c] > mumax) mumax = g_vb.mu[c];
+        if (liquid && cnt) {
+          lo[0] = i < lo[0] ? i : lo[0]; hi[0] = i > hi[0] ? i : hi[0];
+          lo[1] = j < lo[1] ? j : lo[1]; hi[1] = j > hi[1] ? j : hi[1];
+          lo[2] = k < lo[2] ? k : lo[2]; hi[2] = k > hi[2] ? k : hi[2];
+        }
+      }
+  if (mumax <= 0.f || hi[0] < 0) return 0;
+  int dims[3] = {nx, ny, nz};
+  for (int a = 0; a < 3; a++) { /* two cells of margin: the surface faces and their edges */
+    g_vbox[2 * a] = lo[a] - 2 > 0 ? lo[a] - 2 : 0;
+    g_vbox[2 * a + 1] = hi[a] + 3 < dims[a] ? hi[a] + 3 : dims[a];
+  }
+  const int *B = g_vbox;
+  /* solid cells take their neighbours' viscosity, so no-slip walls have something to shear against */
+  for (int k = B[4]; k < B[5]; k++)
+    for (int j = B[2]; j < B[3]; j++)
+      for (int i = B[0]; i < B[1]; i++) {
+        size_t c = CI(f, i, j, k);
+        if (!f->solid[c]) continue;
+        float m = 0.f;
+        int n = 0;
+        const int di[6] = {-1, 1, 0, 0, 0, 0}, dj[6] = {0, 0, -1, 1, 0, 0}, dk[6] = {0, 0, 0, 0, -1, 1};
+        for (int q = 0; q < 6; q++) {
+          int ii = i + di[q], jj = j + dj[q], kk = k + dk[q];
+          if (ii < 0 || jj < 0 || kk < 0 || ii >= nx || jj >= ny || kk >= nz) continue;
+          size_t d = CI(f, ii, jj, kk);
+          if (f->ctype[d] == 0 && g_vb.mu[d] > 0.f) { m += g_vb.mu[d]; n++; }
+        }
+        g_vb.mu[c] = n ? m / n : 0.f;
+      }
+  /* the unknowns: every non-solid face in the box with mass or stiffness. Air faces next to the liquid are
+   * unknowns too (zero mass): holding them at extrapolated values would grip the surface and drain angular
+   * momentum; free, they relax to a stress-free surface */
+  const float rho = f->fp[FP_density] > 1.f ? f->fp[FP_density] : 1000.f;
+  const float i2 = 1.f / (f->dx * f->dx);
+  size_t maxf = (size_t)(B[1] - B[0] + 1) * (B[3] - B[2] + 1) * (B[5] - B[4] + 1) * 3;
+  if ((int)maxf > g_vcap) {
+    g_vcap = (int)maxf;
+    g_vf = (VFace *)realloc(g_vf, sizeof(VFace) * maxf);
+    float **v[7] = {&g_vm, &g_vdg, &g_vx, &g_vr, &g_vz, &g_vp, &g_vq};
+    for (int a = 0; a < 7; a++) *v[a] = (float *)realloc(*v[a], 4 * maxf);
+  }
+  int nfree = 0;
+  for (int comp = 0; comp < 3; comp++) {
+    int sx = nx + (comp == 0), sy = ny + (comp == 1), sz = nz + (comp == 2);
+    size_t off = comp == 0 ? 0 : (comp == 1 ? f->nu : f->nu + f->nv);
+    const float *A = comp == 0 ? f->u : (comp == 1 ? f->v : f->w);
+    int i1 = B[1] + (comp == 0), j1 = B[3] + (comp == 1), k1 = B[5] + (comp == 2);
+    for (int k = B[4]; k < k1 && k < sz; k++)
+      for (int j = B[2]; j < j1 && j < sy; j++)
+        for (int i = B[0]; i < i1 && i < sx; i++) {
+          size_t q = (size_t)i + (size_t)sx * ((size_t)j + (size_t)sy * k);
+          int ia = i - (comp == 0), ja = j - (comp == 1), ka = k - (comp == 2);
+          int solid = is_solid(f, ia, ja, ka) || is_solid(f, i, j, k);
+          g_vb.x[off + q] = solid ? 0.f : A[q];
+          if (solid) continue;
+          float m = 0.5f * (vb_cell(f, g_vb.frac, ia, ja, ka) + vb_cell(f, g_vb.frac, i, j, k));
+          float cells = vb_cell(f, g_vb.mu, ia, ja, ka) * vb_cell(f, g_vb.frac, ia, ja, ka) +
+                        vb_cell(f, g_vb.mu, i, j, k) * vb_cell(f, g_vb.frac, i, j, k);
+          float edges;
+          if (comp == 0) edges = vb_exy(f, i, j, k) + vb_exy(f, i, j + 1, k) + vb_exz(f, i, j, k) + vb_exz(f, i, j, k + 1);
+          else if (comp == 1) edges = vb_exy(f, i, j, k) + vb_exy(f, i + 1, j, k) + vb_eyz(f, i, j, k) + vb_eyz(f, i, j, k + 1);
+          else edges = vb_exz(f, i, j, k) + vb_exz(f, i + 1, j, k) + vb_eyz(f, i, j, k) + vb_eyz(f, i, j + 1, k);
+          float d = rho * m + h * i2 * (2.f * cells + edges);
+          if (d <= 1e-12f) continue;
+          VFace *F = &g_vf[nfree];
+          F->g = (int)(off + q); F->comp = comp; F->i = i; F->j = j; F->k = k;
+          g_vm[nfree] = m;
+          g_vdg[nfree] = d;
+          nfree++;
+        }
+  }
+  if (!nfree) return 0;
+  /* CG on the change d: A d = b - A x0, b = rho m x0, so r0 = -dt gradQ(x0) */
+  float *x = g_vb.x, *pf = g_vb.p; /* pf: the search direction in the full layout (zero off the unknowns) */
+  vb_apply(f, x, g_vr, nfree, h, rho, big);
+  double bn = 0;
+  for (int n = 0; n < nfree; n++) {
+    float bb = rho * g_vm[n] * x[g_vf[n].g];
+    g_vr[n] = bb - g_vr[n];
+    bn += (double)bb * bb;
+  }
+  double tol = f->fp[FP_visc_tol] * (sqrt(bn) > 1e-12 ? sqrt(bn) : 1.0);
+  int it = 0, maxit = (int)f->fp[FP_visc_iter];
+  g_vb.res = 0.f;
+  if (sqrt(vb_dot(g_vr, g_vr, nfree, big)) > tol) {
+    memset(pf, 0, sizeof(float) * (f->nu + f->nv + f->nw));
+#pragma omp parallel for schedule(static) if (big)
+    for (int n = 0; n < nfree; n++) { g_vz[n] = g_vr[n] / g_vdg[n]; g_vp[n] = g_vz[n]; }
+    double rz = vb_dot(g_vr, g_vz, nfree, big);
+    for (it = 1; it <= maxit; it++) {
+#pragma omp parallel for schedule(static) if (big)
+      for (int n = 0; n < nfree; n++) pf[g_vf[n].g] = g_vp[n];
+      vb_apply(f, pf, g_vq, nfree, h, rho, big);
+      double pq = vb_dot(g_vp, g_vq, nfree, big);
+      if (pq <= 0.0) break;
+      float alpha = (float)(rz / pq);
+#pragma omp parallel for schedule(static) if (big)
+      for (int n = 0; n < nfree; n++) { x[g_vf[n].g] += alpha * g_vp[n]; g_vr[n] -= alpha * g_vq[n]; }
+      double rn = sqrt(vb_dot(g_vr, g_vr, nfree, big));
+      if (rn < tol) break;
+#pragma omp parallel for schedule(static) if (big)
+      for (int n = 0; n < nfree; n++) g_vz[n] = g_vr[n] / g_vdg[n];
+      double rz2 = vb_dot(g_vr, g_vz, nfree, big);
+      float beta = (float)(rz2 / rz);
+      rz = rz2;
+#pragma omp parallel for schedule(static) if (big)
+      for (int n = 0; n < nfree; n++) g_vp[n] = g_vz[n] + beta * g_vp[n];
+    }
+    g_vb.res = (float)(sqrt(vb_dot(g_vr, g_vr, nfree, big)) / (sqrt(bn) + 1e-30));
+  }
+  g_vb.iters = it;
+  for (int n = 0; n < nfree; n++) { /* back into the grid */
+    const VFace *F = &g_vf[n];
+    float *A = F->comp == 0 ? f->u : (F->comp == 1 ? f->v : f->w);
+    size_t off = F->comp == 0 ? 0 : (F->comp == 1 ? f->nu : f->nu + f->nv);
+    A[F->g - off] = x[F->g];
+  }
+  return it ? it : 1;
+}
+
+/* heat moves between neighbouring particles (conduct) and leaves through the surface (crust) */
+static void lq_heat(NvSys *s, NvFluid *f, float h, int big) {
+  PB *P = &s->p;
+  const int nx = f->nx, ny = f->ny, nz = f->nz;
+  vb_reserve(f);
+  float *Tc = g_vb.sxx; /* scratch: mean temperature per cell */
+  int any = 0;
+  for (int k = 0; k < s->nk; k++) any |= s->kp[k][KP_conduct] > 0.f || s->kp[k][KP_crust] > 0.f;
+  if (!any) return;
+#pragma omp parallel for schedule(static) if (big)
+  for (size_t c = 0; c < f->nc; c++) {
+    int a0 = g_lq.start[c], a1 = g_lq.start[c + 1];
+    float t = 0.f;
+    for (int a = a0; a < a1; a++) t += P->temp[g_lq.order[a]];
+    Tc[c] = a1 > a0 ? t / (a1 - a0) : -1.f;
+  }
+  const float Ta = s->sp[SP_t_ambient];
+#pragma omp parallel for schedule(dynamic, 64) if (big)
+  for (int k = 0; k < nz; k++)
+    for (int j = 0; j < ny; j++)
+      for (int i = 0; i < nx; i++) {
+        size_t c = CI(f, i, j, k);
+        int a0 = g_lq.start[c], a1 = g_lq.start[c + 1];
+        if (a0 == a1) continue;
+        float sum = 0.f;
+        int n = 0, open = 0;
+        for (int dz = -1; dz <= 1; dz++)
+          for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++) {
+              int ii = i + dx, jj = j + dy, kk = k + dz;
+              if (ii < 0 || jj < 0 || kk < 0 || ii >= nx || jj >= ny || kk >= nz) continue;
+              size_t d = CI(f, ii, jj, kk);
+              if (Tc[d] >= 0.f) { sum += Tc[d]; n++; }
+              else if (abs(dx) + abs(dy) + abs(dz) == 1 && f->ctype[d] == 2) open = 1;
+            }
+        float mean = n ? sum / n : Tc[c];
+        for (int a = a0; a < a1; a++) {
+          int p = g_lq.order[a];
+          const float *K = s->kp[P->kind[p]];
+          float T = P->temp[p];
+          if (K[KP_conduct] > 0.f) T += (mean - T) * (1.f - expf(-K[KP_conduct] * h));
+          if (open && K[KP_crust] > 0.f) T += (Ta - T) * (1.f - expf(-K[KP_crust] * h));
+          P->temp[p] = T;
+        }
+      }
+}
+
+API void nv_liquid_stats(float *o) { o[0] = (float)g_vb.iters; o[1] = g_vb.res; }
+
 static void lq_substep_(NvSys *s, NvFluid *f, float h);
 /* Threads sized to the work: a small liquid on all cores spends its time at barriers, and when the machine
  * is busy (Blender's own threads, other programs) a preempted thread stalls every barrier: seen, 60 ms
@@ -3208,7 +3592,63 @@ static void lq_substep_(NvSys *s, NvFluid *f, float h) {
   for (size_t q = 0; q < f->nv; q++) if (wv[q] > 1e-6f) V[q] += g[1] * h;
 #pragma omp parallel for schedule(static) if (big)
   for (size_t q = 0; q < f->nw; q++) if (ww[q] > 1e-6f) W[q] += g[2] * h;
-  if (f->n_prs) project_(f, U, V, W);
+  /* keep the volume: FLIP particles drift apart (or bunch up) over time, and a divergence-free velocity never
+   * brings them back. Interior cells emptier than the liquid's rest density get a small target convergence,
+   * crowded ones a small expansion (the gas solver's expansion term), so the liquid holds its volume. The rest
+   * density is measured when the liquid first has an interior: however densely it was seeded, it keeps that */
+  {
+    const float beta = clampf(f->fp[FP_density_fix], 0.f, 1.f) / h;
+    if (f->lq_rest <= 0.f) {
+      double sum = 0;
+      int cnt = 0;
+      for (int k = 1; k < nz - 1; k++)
+        for (int j = 1; j < ny - 1; j++)
+          for (int i = 1; i < nx - 1; i++) {
+            size_t c = CI(f, i, j, k);
+            if (f->ctype[c] != 0 || f->ctype[c - 1] == 2 || f->ctype[c + 1] == 2 || f->ctype[c - nx] == 2 ||
+                f->ctype[c + nx] == 2 || f->ctype[c - (size_t)nx * ny] == 2 || f->ctype[c + (size_t)nx * ny] == 2)
+              continue;
+            sum += g_lq.start[c + 1] - g_lq.start[c];
+            cnt++;
+          }
+      if (cnt >= 8) f->lq_rest = (float)(sum / cnt);
+    }
+    const float rest = f->lq_rest > 0.f ? f->lq_rest : 8.f;
+#pragma omp parallel for schedule(static) if (big)
+    for (int k = 0; k < nz; k++)
+      for (int j = 0; j < ny; j++)
+        for (int i = 0; i < nx; i++) {
+          size_t c = CI(f, i, j, k);
+          float e = 0.f;
+          if (beta > 0.f && f->ctype[c] == 0 && i > 0 && j > 0 && k > 0 && i < nx - 1 && j < ny - 1 && k < nz - 1 &&
+              f->ctype[c - 1] != 2 && f->ctype[c + 1] != 2 && f->ctype[c - nx] != 2 && f->ctype[c + nx] != 2 &&
+              f->ctype[c - (size_t)nx * ny] != 2 && f->ctype[c + (size_t)nx * ny] != 2) {
+            float cnt = (float)(g_lq.start[c + 1] - g_lq.start[c]);
+            e = rest > 0.f && f->lq_rest > 0.f ? clampf(beta * (cnt / rest - 1.f), -0.5f / h, 0.5f / h) : 0.f;
+          }
+          f->expn[c] = e;
+        }
+  }
+  /* viscosity sees the air faces too (shear across the surface): give them the neighbouring velocity first */
+  {
+    uint8_t *vm = (uint8_t *)f->tmp[7], *tm = (uint8_t *)f->tmp[8];
+    for (int comp = 0; comp < 3; comp++) {
+      int sx = nx + (comp == 0), sy = ny + (comp == 1), sz = nz + (comp == 2);
+      size_t nfc = (size_t)sx * sy * sz;
+      float *A = comp == 0 ? U : (comp == 1 ? V : W);
+      const float *Wt = comp == 0 ? wu : (comp == 1 ? wv : ww);
+      for (size_t q = 0; q < nfc; q++) vm[q] = Wt[q] > 1e-6f;
+      lq_extrapolate(A, vm, tm, sx, sy, sz, 2);
+    }
+  }
+  lq_heat(s, f, h, big);
+  /* viscosity and pressure, alternated: each pass moves the split solve toward the coupled (Stokes) one */
+  int passes = (int)f->fp[FP_visc_couple];
+  passes = passes < 1 ? 1 : (passes > 4 ? 4 : passes);
+  for (int pass = 0; pass < passes; pass++) {
+    if (!lq_viscosity(s, f, h, big) && pass > 0) break;
+    if (f->n_prs) project_(f, U, V, W);
+  }
   /* 5. faces next to liquid are valid; spread into the air. FLIP change only where we had samples */
   uint8_t *vm = (uint8_t *)f->tmp[7], *tm = (uint8_t *)f->tmp[8];
   for (int comp = 0; comp < 3; comp++) {
@@ -3244,6 +3684,10 @@ static void lq_substep_(NvSys *s, NvFluid *f, float h) {
       vg[comp] = face_samp(f, comp == 0 ? U : (comp == 1 ? V : W), comp, x, y, z);
       dv[comp] = face_samp(f, comp == 0 ? f->u0 : (comp == 1 ? f->v0 : f->w0), comp, x, y, z);
     }
+    if (lq_mu(s->kp[P->kind[i]], P->temp[i]) >= LQ_FROZEN) { /* still solid: stays put */
+      P->vx[i] = P->vy[i] = P->vz[i] = 0.f;
+      continue;
+    }
     float vx = flip * (P->vx[i] + dv[0]) + (1.f - flip) * vg[0];
     float vy = flip * (P->vy[i] + dv[1]) + (1.f - flip) * vg[1];
     float vz = flip * (P->vz[i] + dv[2]) + (1.f - flip) * vg[2];
@@ -3252,6 +3696,14 @@ static void lq_substep_(NvSys *s, NvFluid *f, float h) {
     float vm3[3];
     for (int comp = 0; comp < 3; comp++) vm3[comp] = face_samp(f, comp == 0 ? U : (comp == 1 ? V : W), comp, mx, my, mz);
     float px = P->x[i] + h * vm3[0], py = P->y[i] + h * vm3[1], pz = P->z[i] + h * vm3[2];
+    for (int q = 0; q < s->ninflow; q++) { /* held at the nozzle's velocity */
+      const float *N = s->inflow[q];
+      float ddx = P->x[i] - N[0], ddy = P->y[i] - N[1], ddz = P->z[i] - N[2];
+      if (ddx * ddx + ddy * ddy + ddz * ddz > N[3] * N[3]) continue;
+      vx = N[4]; vy = N[5]; vz = N[6];
+      px = P->x[i] + h * vx; py = P->y[i] + h * vy; pz = P->z[i] + h * vz;
+      break;
+    }
     /* colliders: push out, remove the velocity into the surface (no bounce: liquids do not bounce) */
     for (int c = 0; c < s->ncol; c++) {
       float pp[3] = {px, py, pz}, op[3], nn[3];

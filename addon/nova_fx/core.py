@@ -36,6 +36,7 @@ _SIGS = {
     "nv_sys_set_colliders": (None, [_vp, C.c_int, _f]),
     "nv_sys_set_forces": (None, [_vp, C.c_int, _f]),
     "nv_sys_set_shape": (C.c_int, [_vp, C.c_int, C.c_int, _f]),
+    "nv_sys_set_inflows": (None, [_vp, C.c_int, _f]),
     "nv_sys_set_sdf": (C.c_int, [_vp, C.c_int, C.c_int, C.c_int, C.c_int, C.c_float, C.c_float, C.c_float,
                                  C.c_float, _f]),
     "nv_sys_count": (C.c_int, [_vp]),
@@ -63,6 +64,7 @@ _SIGS = {
     "nv_frame": (None, [_vp, _vp, C.c_float, C.c_int]),
     "nv_stats": (None, [_vp, _vp, _f]),
     "nv_lightning": (C.c_int, [_f, C.c_int, _f, C.POINTER(C.c_int)]),
+    "nv_liquid_stats": (None, [_f]),
     "nv_upres_new": (_vp, [_vp, C.c_int]),
     "nv_upres_free": (None, [_vp]),
     "nv_upres_reset": (None, [_vp]),
@@ -332,6 +334,11 @@ class System:
         """recs: [type, pos(3), axis(3), strength, radius, freq, falloff, shape slot] per force."""
         a = np.ascontiguousarray(np.asarray(recs, np.float32).reshape(-1, 12)) if len(recs) else np.zeros((1, 12), np.float32)
         lib().nv_sys_set_forces(self.h, len(recs), fptr(a))
+
+    def set_inflows(self, recs):
+        """Liquid nozzles: [(cx, cy, cz, radius, vx, vy, vz), ...]. Liquid inside moves at that velocity."""
+        a = np.ascontiguousarray(np.asarray(recs, np.float32).reshape(-1, 7)) if len(recs) else np.zeros((1, 7), np.float32)
+        lib().nv_sys_set_inflows(self.h, len(recs), fptr(a))
 
     def set_shape(self, slot, pts):
         """Store a point set (n, 3) in a shape slot (0-31) for Form forces and Shape bursts."""

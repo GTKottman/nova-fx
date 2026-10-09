@@ -145,6 +145,8 @@ def draw_kind_group(layout, k, n, gid):
         ref = {"death": "death_kind", "trail": "trail_kind", "split": "split_kind"}.get(gid)
         if ref and name != ref and not getattr(k, ref):
             continue
+        if gid == "liquid" and name != "liquid" and not k.liquid:
+            continue
         if gid == "collide" and name != "collide" and k.collide == "NONE":
             continue
         if name in {"hit_count", "hit_speed"} and not k.hit_kind:
@@ -216,6 +218,7 @@ class NOVA_PT_fluid(_Panel, bpy.types.Panel):
         layout.prop(fl, "domain")
         layout.prop(fl, "resolution")
         if fl.mode == "LIQUID":
+            layout.prop(fl, "look")
             layout.prop(fl, "flip")
             layout.prop(fl, "walls")
             col = layout.column(align=True)
@@ -228,6 +231,8 @@ class NOVA_PT_fluid(_Panel, bpy.types.Panel):
             if body:
                 body.prop(fl, "cfl")
                 body.prop(fl, "max_sub")
+                body.prop(fl, "visc_couple")
+                body.prop(fl, "visc_iter")
                 body.prop(fl, "cg_tol")
             return
         layout.prop(fl, "device", expand=True)
@@ -317,6 +322,8 @@ class NOVA_PT_emitter(_Panel, bpy.types.Panel):
         if e.system:
             layout.prop_search(e, "kind", e.system.nova, "kinds", icon="PARTICLES")
         layout.prop(e, "shape")
+        if e.system and e.kind in e.system.nova.kinds and e.system.nova.kinds[e.kind].liquid:
+            layout.prop(e, "nozzle")
         if e.shape == "DISSOLVE":
             layout.prop(e, "dissolve_source")
             src = e.dissolve_source or context.object
@@ -388,6 +395,12 @@ class NOVA_PT_force(_Panel, bpy.types.Panel):
         layout.use_property_split = True
         layout.prop(f, "type")
         layout.prop(f, "system")
+        if f.type == "HEAT":
+            layout.prop(f, "temperature")
+            layout.prop(f, "heat_rate")
+            layout.prop(f, "radius")
+            layout.prop(f, "falloff")
+            return
         if f.type == "FORM":
             layout.prop(f, "target")
             target = f.target or context.object

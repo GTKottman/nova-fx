@@ -20,7 +20,8 @@
   X(split_kind, -1) X(split_rate, 0) X(split_count, 3) X(split_speed, 3)                  \
   X(split_inherit, 0.7) X(split_max_gen, 3)                                               \
   X(hit_kind, -1) X(hit_count, 0) X(hit_speed, 2)                                         \
-  X(fl_smoke, 0) X(fl_heat, 0) X(fl_fuel, 0) X(liquid, 0)
+  X(fl_smoke, 0) X(fl_heat, 0) X(fl_fuel, 0) X(liquid, 0)                                \
+  X(viscosity, 0) X(visc_temp, 0) X(conduct, 0) X(crust, 0)
 
 /* Global particle-system parameters. */
 #define SYS_PARAMS(X)                                                                     \
@@ -38,7 +39,8 @@
   X(wind_x, 0) X(wind_y, 0) X(wind_z, 0) X(wind_drag, 0)                                  \
   X(cfl, 2.5) X(max_sub, 4) X(cg_tol, 1e-3) X(cg_iter, 60)                                \
   X(maccormack, 1) X(reflect, 1) X(closed_floor, 1) X(seed, 0) X(sparse, 1)                \
-  X(liquid, 0) X(flip, 0.95) X(walls, 1)
+  X(liquid, 0) X(flip, 0.95) X(walls, 1) X(visc_iter, 300) X(visc_tol, 1e-4) X(density, 1000)  \
+  X(visc_couple, 1) X(density_fix, 0.3)
 
 #define NV_E_F(n, d) FP_##n,
 enum { FLUID_PARAMS(NV_E_F) FP_COUNT };
