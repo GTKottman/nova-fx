@@ -131,6 +131,15 @@ def _fluid_annotations():
         ("BOX", "Box", "Closed on every side"),
     ], default="TANK")
     ann["surface"] = PointerProperty(name="Surface Object", type=bpy.types.Object)
+    ann["gas_look"] = EnumProperty(name="Look", items=[
+        ("FIRE", "Fire & Smoke", "Flame glows by temperature, smoke absorbs"),
+        ("SPIRIT", "Spirit", "Glowing mist: it shines where it is dense, coloured from Color to End Color as "
+                             "its heat fades"),
+    ], default="FIRE", update=lambda s, c: _material_update(s, c))
+    ann["spirit_color"] = FloatVectorProperty(name="Color", subtype="COLOR", size=3, min=0, max=1,
+                                              default=(0.35, 0.85, 1.0), update=lambda s, c: _material_update(s, c))
+    ann["spirit_color2"] = FloatVectorProperty(name="End Color", subtype="COLOR", size=3, min=0, max=1,
+                                               default=(0.55, 0.2, 1.0), update=lambda s, c: _material_update(s, c))
     ann["surface_radius"] = FloatProperty(name="Surface Radius", default=1.2, min=0.2, soft_max=3,
                                           update=lambda s, c: _liquid_update(s, c),
                                           description="Particle radius for the surface, in grid cells. Bigger "
@@ -224,7 +233,16 @@ class NovaSystem(bpy.types.PropertyGroup):
     display: EnumProperty(name="Display", items=[
         ("POINTS", "Points", "Spheres (Cycles motion blur uses the velocity attribute)"),
         ("STREAKS", "Streaks", "Stretch each particle along its motion (works in EEVEE and Cycles)"),
+        ("RIBBONS", "Light Ribbons", "Each particle draws a glowing trail through its last frames"),
     ], default="POINTS", update=_display_update)
+    ribbon_frames: IntProperty(name="Trail Frames", default=12, min=2, max=120, update=_display_update,
+                               description="How many frames back each ribbon reaches")
+    ribbon_taper: FloatProperty(name="Tail Width", default=0.15, min=0, max=1, update=_display_update,
+                                description="Ribbon width at the tail, relative to the head")
+    ribbon_heads: BoolProperty(name="Show Heads", default=False, update=_display_update,
+                               description="Also draw each particle as a glowing point at the front of its ribbon")
+    ribbon_glow: FloatProperty(name="Ribbon Glow", default=0.6, min=0, soft_max=2, update=_display_update,
+                               description="Ribbon brightness relative to the particle's own")
     streak_length: FloatProperty(name="Streak Length", default=0.03, min=0, soft_max=0.5, unit="TIME_ABSOLUTE",
                                  description="Seconds of motion each streak covers", update=_display_update)
     viewport_pct: IntProperty(name="Viewport %", default=100, min=1, max=100, subtype="PERCENTAGE",
@@ -278,6 +296,7 @@ class NovaEmitter(bpy.types.PropertyGroup):
         ("NORMAL", "Normal", "Surface normal (origin for Point/Sphere: outward)"),
         ("OBJECT_Z", "Object Z", "Along the object's local Z axis"),
         ("RANDOM", "Random", "Any direction"),
+        ("TANGENT", "Around Z", "Sideways around the object's Z axis: sparks flung off a spinning ring"),
     ], default="OBJECT_Z")
     speed: FloatProperty(name="Speed", default=5.0, min=0, soft_max=200, unit="VELOCITY")
     speed_var: FloatProperty(name="Speed Variation", default=0.2, min=0, max=1)

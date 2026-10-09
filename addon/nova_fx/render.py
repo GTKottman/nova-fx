@@ -62,10 +62,14 @@ def particle_material(sysob):
 def volume_material(sysob):
     name = f"{VMAT} · {sysob.name}"
     mat = bpy.data.materials.get(name)
-    if mat and mat.node_tree and mat.get("nova_v") == 4:
+    look = sysob.nova.fluid.gas_look
+    if mat and mat.node_tree and mat.get("nova_v") == 4 and mat.get("look", "FIRE") == look:
         return mat
     mat = mat or bpy.data.materials.new(name)
     mat["nova_v"] = 4
+    mat["look"] = look
+    if look == "SPIRIT":
+        return _spirit_material(mat)
     if not mat.node_tree:
         mat.use_nodes = True
     nt = mat.node_tree
@@ -101,6 +105,37 @@ def volume_material(sysob):
     L.new(flame.outputs["Fac"], fm.inputs[0])
     L.new(fm.outputs[0], hm.inputs[1])
     L.new(hm.outputs[0], vol.inputs["Emission Strength"])
+    L.new(vol.outputs[0], out.inputs["Volume"])
+    vol.inputs["Density Attribute"].default_value = "density"
+    vol.inputs["Temperature Attribute"].default_value = ""
+    vol.inputs["Blackbody Intensity"].default_value = 0.0
+    return mat
+
+
+def _spirit_material(mat):
+    """Glowing mist: emission where it is dense, coloured by its remaining heat, barely absorbing."""
+    if not mat.node_tree:
+        mat.use_nodes = True
+    nt = mat.node_tree
+    nt.nodes.clear()
+    out = _node(nt, "ShaderNodeOutputMaterial", (900, 0))
+    vol = _node(nt, "ShaderNodeVolumePrincipled", (550, 0))
+    vol.name = "nova_volume"
+    dens = _node(nt, "ShaderNodeAttribute", (-700, 100), attribute_name="density", label="density")
+    heat = _node(nt, "ShaderNodeAttribute", (-700, -150), attribute_name="heat", label="heat")
+    ramp = _node(nt, "ShaderNodeMix", (-250, -150))
+    ramp.data_type = "RGBA"
+    ramp.name = "nova_spirit"
+    clamp = _node(nt, "ShaderNodeMath", (-450, -150), operation="MULTIPLY", use_clamp=True)
+    clamp.inputs[1].default_value = 1.5
+    glow = _node(nt, "ShaderNodeMath", (-250, 100), operation="MULTIPLY", label="Glow")
+    glow.name = "nova_spirit_glow"
+    L = nt.links
+    L.new(heat.outputs["Fac"], clamp.inputs[0])
+    L.new(clamp.outputs[0], ramp.inputs["Factor"])
+    L.new(dens.outputs["Fac"], glow.inputs[0])
+    L.new(ramp.outputs["Result"], vol.inputs["Emission Color"])
+    L.new(glow.outputs[0], vol.inputs["Emission Strength"])
     L.new(vol.outputs[0], out.inputs["Volume"])
     vol.inputs["Density Attribute"].default_value = "density"
     vol.inputs["Temperature Attribute"].default_value = ""
@@ -246,9 +281,16 @@ def sync_display(sysob):
         if not sob.data.materials:
             sob.data.materials.append(mat)
         sob.update_tag()
-    # the points stay selectable (panels live on them) but show as a box while streaks draw
-    sysob.hide_render = streaks
-    sysob.display_type = "BOUNDS" if streaks else "TEXTURED"
+    from . import ribbons
+    rob = ribbons.ribbon_object(sysob, create=n.display == "RIBBONS")
+    if rob is not None:
+        rob.hide_render = rob.hide_viewport = n.display != "RIBBONS"
+        if not rob.data.materials:
+            rob.data.materials.append(mat)
+    lines = streaks or (n.display == "RIBBONS" and not n.ribbon_heads)
+    # the points stay selectable (panels live on them) but show as a box while streaks or ribbons draw
+    sysob.hide_render = lines
+    sysob.display_type = "BOUNDS" if lines else "TEXTURED"
     sysob.update_tag()
 
 
@@ -263,6 +305,9 @@ def sync_materials(sysob):
         if m:
             m.inputs[0].default_value = 1.0 if n.shading == "LIT" else 0.0
     vmat = bpy.data.materials.get(f"{VMAT} · {sysob.name}")
+    if vmat and vmat.node_tree and vmat.get("look", "FIRE") != n.fluid.gas_look and n.fluid.volume:
+        ensure_volume_material(sysob)  # the look changed: rebuild (it calls back here)
+        return
     if vmat and vmat.node_tree:
         fl = n.fluid
         nt = vmat.node_tree
@@ -270,6 +315,12 @@ def sync_materials(sysob):
         if v:
             v.inputs["Density"].default_value = fl.density_mult
             v.inputs["Color"].default_value = (*fl.smoke_color, 1.0)
+        sp = nt.nodes.get("nova_spirit")
+        if sp:  # spirit: Color when fresh (hot), End Color as it fades; glow from Flame Brightness; thin
+            sp.inputs["A"].default_value = (*fl.spirit_color2, 1)
+            sp.inputs["B"].default_value = (*fl.spirit_color, 1)
+            nt.nodes["nova_spirit_glow"].inputs[1].default_value = fl.flame_mult
+            v.inputs["Density"].default_value = fl.density_mult * 0.05
         k = nt.nodes.get("nova_kelvin")
         if k:
             k.inputs[1].default_value = fl.temp_scale

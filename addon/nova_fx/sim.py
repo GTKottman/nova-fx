@@ -527,6 +527,14 @@ def emit_frame(rt, scene, sysob, frame, dt, depsgraph):
                 dirs = np.tile(z, (n, 1))
             elif em.direction == "RANDOM":
                 dirs = _random_dirs(n, rng)
+            elif em.direction == "TANGENT":  # around the object's Z axis, the way the object turns
+                z = np.array(cur.to_3x3() @ Vector((0, 0, 1)), np.float32)
+                z /= max(np.linalg.norm(z), 1e-9)
+                rad = pw1 - np.array(cur.to_translation(), np.float32)
+                tng = np.cross(np.tile(z, (n, 1)), rad)
+                ln = np.linalg.norm(tng, axis=1)
+                dirs = np.where(ln[:, None] > 1e-9, tng / np.maximum(ln, 1e-9)[:, None], _random_dirs(n, rng))
+                dirs = dirs.astype(np.float32)
             else:
                 dirs = _xform_dir(cur, d)
             dirs = _cone(dirs, em.spread, rng) if em.direction != "RANDOM" else dirs
@@ -807,14 +815,19 @@ def load_into(sysob, data):
 
 def load_frame(sysob, frame):
     path = particle_path(sysob, frame)
+    ok = False
     if os.path.exists(path):
         try:
             load_into(sysob, core.read_cache(path))
-            return True
+            ok = True
         except (ValueError, OSError):
             pass
-    load_into(sysob, {"n": 0})
-    return False
+    if not ok:
+        load_into(sysob, {"n": 0})
+    if sysob.nova.display == "RIBBONS":
+        from . import ribbons
+        ribbons.build(sysob, frame, lambda f: particle_path(sysob, f))
+    return ok
 
 
 def reload_frame(sysob, scene):

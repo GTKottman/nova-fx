@@ -277,6 +277,10 @@ class NOVA_PT_fluid(_Panel, bpy.types.Panel):
         header, body = layout.panel("nova_fluid_look", default_closed=False)
         header.label(text="Look")
         if body:
+            body.prop(fl, "gas_look")
+            if fl.gas_look == "SPIRIT":
+                body.prop(fl, "spirit_color")
+                body.prop(fl, "spirit_color2")
             for name in ("density_mult", "smoke_color", "flame_mult", "heat_mult", "temp_scale", "write_velocity"):
                 body.prop(fl, name)
 
@@ -298,6 +302,11 @@ class NOVA_PT_display(_Panel, bpy.types.Panel):
         layout.prop(n, "display")
         if n.display == "STREAKS":
             layout.prop(n, "streak_length")
+        if n.display == "RIBBONS":
+            layout.prop(n, "ribbon_frames")
+            layout.prop(n, "ribbon_taper")
+            layout.prop(n, "ribbon_glow")
+            layout.prop(n, "ribbon_heads")
         layout.prop(n, "shading")
         layout.prop(n, "size_mult")
         layout.prop(n, "emission_mult")

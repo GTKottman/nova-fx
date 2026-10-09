@@ -49,6 +49,11 @@ make -C core
 | Melting Text | Wax letters soften under a moving heat lamp and slump into a puddle |
 | Slime | A blob of slime drops onto steps and oozes down them |
 | Blood | A pool of blood wells up and creeps across a tiled floor |
+| Portal | A spinning ring flings sparks while ribbons of light swirl inside it |
+| Spell Circle | Motes draw a turning spell circle on the ground; lights rise from it |
+| Wisps | Will-o'-wisps wander through the dark, drawing trails and shedding motes |
+| Arcane Orb | Light orbits a floating orb while arcs of lightning crackle out from it |
+| Spirit Smoke | Glowing mist that shines cyan where it is fresh and fades to violet |
 | Burn Away | An object disintegrates along a ragged glowing front, shedding embers and ash |
 | Lightning | Cloud-to-ground strike grown by the dielectric breakdown model: stepped leader, return strokes, cooling afterglow, impact spatter. With *Camera, World & Glow*, a cloud deck the flash lights from inside |
 | Empty System | Starting point |
@@ -234,6 +239,22 @@ music triggers and events.
   Bake skips the surface and it is meshed for display. Blender 5.2 crashes meshing zero points, so the
   tree only meshes when there are some.
 - **Example:** [`examples/splash_tank.py`](examples/splash_tank.py).
+
+### Magic: ribbons, portals, spirits
+- **Light ribbons** (Display → *Light Ribbons*): each particle draws a glowing trail through where it was over the
+  last *Trail Frames*.
+  - The trail comes from the cache: earlier frames are read back and matched by particle id, so a ribbon is
+    exactly the path the particle took. There is no extra simulation state.
+  - Written to a companion Curves object as Catmull-Rom curves. The width tapers and the glow fades toward the
+    tail, drawn with the system's own material.
+  - *Show Heads* also draws the particles as points.
+- **Around Z** emitter direction: particles leave sideways, around the emitter's Z axis. Spin a ring and sparks
+  are flung off it.
+- **Spirit** gas look: the fire solver's smoke shines instead of absorbing. It is coloured from *Color* (fresh,
+  still hot) to *End Color* as its heat fades.
+- **Presets:** Portal (sparks flung off a spinning ring, ribbons swirling inside), Spell Circle (motes form a
+  generated sigil of rings, a star polygon and rune marks, which turns slowly), Wisps, Arcane Orb (ribbons
+  held in orbit by a spin and a pull balanced for v²/r, plus lightning arcs to points around it), Spirit Smoke.
 
 ### Thick liquids: honey, lava, melting
 Particle types now have a **viscosity** (Pa·s: water 0.001, blood 0.004, honey 10, chocolate 25), and the
@@ -458,6 +479,7 @@ Same plume, empty domain grown from 64³ to 256³ (old → now):
 python3 tests/test_core.py                                     # core: correctness + speed, ~7 s
 blender -b --factory-startup --python tests/blender_presets.py -- --frames 24
 blender -b --factory-startup --python tests/blender_lightning.py   # bolt controls, target, timeline
+blender -b --factory-startup --python tests/blender_magic.py      # ribbons follow real paths, tangent sparks, spirit look
 blender -b --factory-startup --python tests/blender_viscous.py    # nozzle, thin honey stream, looks, melting under a lamp
 blender -b --factory-startup --python tests/blender_liquid.py     # FLIP tank: kept, inside, around the ball, meshed
 blender -b --factory-startup --python tests/blender_upres.py      # fine VDBs: voxel size, smoke total, detail

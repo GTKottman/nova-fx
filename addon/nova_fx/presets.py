@@ -809,6 +809,215 @@ def build_blood(context, coll):
     return s
 
 
+# magic ---------------------------------------------------------------------
+
+def _spin(ob, frames, turns, axis=2):
+    """Keyframe a steady spin about a local axis (linear, so it never eases)."""
+    rot = list(ob.rotation_euler)
+    ob.keyframe_insert("rotation_euler", index=axis, frame=frames[0])
+    rot[axis] += turns * 2 * math.pi
+    ob.rotation_euler = rot
+    ob.keyframe_insert("rotation_euler", index=axis, frame=frames[1])
+    _linear(ob)
+
+
+def _linear(ob):
+    ad = ob.animation_data
+    if ad is None or ad.action is None:
+        return
+    try:
+        from bpy_extras import anim_utils
+        bag = anim_utils.action_get_channelbag_for_slot(ad.action, ad.action_slot)
+        curves = bag.fcurves if bag else []
+    except (ImportError, AttributeError):
+        curves = ad.action.fcurves
+    for fc in curves:
+        for k in fc.keyframe_points:
+            k.interpolation = "LINEAR"
+
+
+def _force(coll, name, loc, kind, system, **kw):
+    ob = _empty(coll, name, loc, kind="SPHERE" if kind != "VORTEX" else "CIRCLE", size=kw.pop("size", 0.5))
+    f = ob.nova_force
+    f.enabled, f.type, f.system = True, kind, system
+    for k, v in kw.items():
+        setattr(f, k, v)
+    return ob
+
+
+def build_portal(context, coll):
+    """A spinning ring of sparks: sparks flung off the rim, ribbons of light swirling inside."""
+    f0, f1 = context.scene.frame_start, context.scene.frame_end
+    sparks = new_system(context, coll, "Portal Sparks", [
+        bb("Rim Spark", 2300, (0.35, 0.9), (0.012, 0.003), 30, drag_quad=0.4, cool=1.6, collide="BOUNCE",
+           bounce=0.35, friction=0.3, split_kind="Ember", split_rate=0.6, split_count=2, split_speed=0.8,
+           split_max_gen=1),
+        bb("Ember", 1900, (0.2, 0.6), (0.006, 0.0), 15, drag_quad=1.0, cool=2.0),
+    ], display="STREAKS", streak_length=0.025, substeps=2)
+    ring = _mesh(coll, "Portal Ring", lambda bm: bmesh.ops.create_circle(bm, cap_ends=False, segments=180,
+                                                                         radius=1.1), (0, 0, 1.5),
+                 (math.radians(90), 0, 0))
+    ring.hide_render = True
+    emitter(coll, sparks, None, "Rim Spark", None, ob=ring, shape="VERTS", rate=7000, direction="TANGENT",
+            speed=4.5, speed_var=0.4, spread=0.25, inherit=0.0)
+    _spin(ring, (f0, f1), -(f1 - f0) / 24 * 0.6)
+    ground(coll, 12)
+    glow = new_system(context, coll, "Portal Glow", [
+        dict(name="Swirl", color_mode="GRADIENT", color=(1.0, 0.55, 0.12), color2=(1.0, 0.85, 0.4), color_var=0.2,
+             life_min=0.8, life_max=1.6, size_start=0.006, size_end=0.002, gravity=0.0, drag_lin=1.0, emit=6.0,
+             emit_var=0.4, fade_in=0.1, fade_out=0.5, collide="NONE"),
+    ], display="RIBBONS", ribbon_frames=10)
+    emitter(coll, glow, "Portal Disc", "Swirl", (0, 0, 1.5), (math.radians(90), 0, 0), "CIRCLE", 1.1,
+            scale=(1, 1, 0.02), shape="SPHERE", radius=1.05, rate=900, direction="RANDOM", speed=0.2)
+    _force(coll, "Portal Swirl", (0, 0, 1.5), "VORTEX", glow, strength=4.0, radius=1.2,
+           size=1.1).rotation_euler = (math.radians(90), 0, 0)
+    _force(coll, "Portal Pull", (0, 0, 1.5), "ATTRACT", glow, strength=1.5, radius=1.0, falloff=0.0)
+    return sparks
+
+
+def sigil_mesh(name, rings=(1.0, 0.86, 0.5), star=7, marks=28):
+    """A spell circle as edges: rings, a star polygon and rune marks between the outer rings."""
+    me = bpy.data.meshes.new(name)
+    bm = bmesh.new()
+
+    def loop(r, n, z=0.0, phase=0.0):
+        vs = [bm.verts.new((r * math.cos(phase + 2 * math.pi * i / n), r * math.sin(phase + 2 * math.pi * i / n), z))
+              for i in range(n)]
+        for i in range(n):
+            bm.edges.new((vs[i], vs[(i + 1) % n]))
+        return vs
+
+    for r in rings:
+        loop(r, 160)
+    pts = [bm.verts.new((rings[1] * math.cos(2 * math.pi * i / star + math.pi / 2),
+                         rings[1] * math.sin(2 * math.pi * i / star + math.pi / 2), 0)) for i in range(star)]
+    step = 3 if star >= 7 else 2
+    for i in range(star):
+        bm.edges.new((pts[i], pts[(i + step) % star]))
+    for i in range(marks):  # little runes: a stroke and a hook, rotated around the band
+        a = 2 * math.pi * (i + 0.5) / marks
+        c, s = math.cos(a), math.sin(a)
+        r0, r1 = rings[1] + 0.025, rings[0] - 0.025
+        mid = (r0 + r1) / 2
+        k = (i * 7) % 3
+        p = [(r0, 0), (r1, 0)] if k == 0 else ([(r0, -0.02), (mid, 0.02), (r1, -0.02)] if k == 1 else
+                                               [(r0, 0.02), (r1, 0.02), (mid, -0.03)])
+        vs = [bm.verts.new((x * c - y * s, x * s + y * c, 0)) for x, y in p]
+        for j in range(len(vs) - 1):
+            bm.edges.new((vs[j], vs[j + 1]))
+    bm.to_mesh(me)
+    bm.free()
+    return me
+
+
+def build_spell_circle(context, coll):
+    """Motes drift in and draw a spell circle on the ground; it turns slowly and lights rise from it."""
+    f0, f1 = context.scene.frame_start, context.scene.frame_end
+    s = new_system(context, coll, "Spell Circle", [
+        dict(name="Sigil Mote", color_mode="FIXED", color=(0.3, 0.8, 1.0), color_var=0.15, life_min=60, life_max=60,
+             size_start=0.0035, size_end=0.0035, gravity=0.0, drag_lin=1.0, emit=3.5, emit_var=0.3, twinkle_freq=3,
+             twinkle_amt=0.4, fade_in=0.05, fade_out=0.02, collide="NONE"),
+        dict(name="Rising Mote", color_mode="GRADIENT", color=(0.4, 0.85, 1.0), color2=(0.6, 0.3, 1.0),
+             color_var=0.2, life_min=1.5, life_max=3.0, size_start=0.008, size_end=0.0, gravity=-0.12,
+             drag_lin=0.6, turb=1.0, force=0.0, emit=5.0, emit_var=0.5, fade_in=0.1, fade_out=0.6, collide="NONE"),
+    ], turb_amp=0.8, turb_freq=1.2, turb_speed=0.6)
+    sig = bpy.data.objects.new("Sigil", sigil_mesh("Sigil"))
+    sig.location = (0, 0, 0.01)
+    sig.scale = (1.5, 1.5, 1.5)
+    sig.hide_render, sig.display_type = True, "WIRE"
+    coll.objects.link(sig)
+    sig.nova_shape.mode, sig.nova_shape.points = "EDGES", 60000
+    _spin(sig, (f0, f1), (f1 - f0) / 24 * 0.05)
+    emitter(coll, s, "Mote Cloud", "Sigil Mote", (0, 0, 1.0), size=2.0, scale=(1.6, 1.6, 0.8), shape="SPHERE",
+            radius=2.0, rate=0, burst=60000, burst_frame=f0, direction="RANDOM", speed=0.3)
+    form = _force(coll, "Sigil Form", (0, 0, 0), "FORM", s, target=sig, snap=2.5, damping=1.0, size=0.3)
+    for fr, pull in ((f0, 0.0), (f0 + 10, 0.0), (f0 + 50, 1.0)):
+        form.nova_force.pull = pull
+        form.nova_force.keyframe_insert("pull", frame=fr)
+    rise = emitter(coll, s, None, "Rising Mote", None, ob=sig, shape="VERTS", rate=400, direction="OBJECT_Z",
+                   speed=0.4, speed_var=0.6, spread=0.3, frame_start=f0 + 45)
+    rise.nova_emitter.frame_start = f0 + 45
+    ground(coll, 12)
+    return s
+
+
+def build_wisps(context, coll):
+    """Will-o'-wisps: a few soft lights wander through the dark, drawing trails and shedding motes."""
+    s = new_system(context, coll, "Wisps", [
+        dict(name="Wisp", color_mode="FIXED", color=(0.45, 1.0, 0.85), color_var=0.25, hue_random=0.08,
+             life_min=60, life_max=60, size_start=0.03, size_end=0.03, size_var=0.3, gravity=0.0, drag_lin=0.8,
+             turb=1.0, emit=5.0, emit_var=0.3, twinkle_freq=1.2, twinkle_amt=0.35, fade_in=0.03, fade_out=0.02,
+             collide="BOUNCE", bounce=0.5, trail_kind="Wisp Mote", trail_rate=25, trail_inherit=0.1,
+             trail_jitter=0.08, inherit_color=False),
+        dict(name="Wisp Mote", color_mode="FIXED", color=(0.5, 1.0, 0.9), color_var=0.2, life_min=0.6, life_max=1.4,
+             size_start=0.006, size_end=0.0, gravity=-0.03, drag_lin=2.0, turb=0.6, emit=4.0, emit_var=0.4,
+             fade_in=0.0, fade_out=0.6, collide="NONE", inherit_color=True),
+    ], turb_amp=1.4, turb_freq=0.35, turb_speed=0.25, display="RIBBONS", ribbon_frames=24, ribbon_taper=0.05,
+        ribbon_heads=True, ribbon_glow=0.25)
+    emitter(coll, s, "Wisp Spawn", "Wisp", (0, 0, 1.0), size=1.2, scale=(2.0, 1.2, 0.5), shape="SPHERE",
+            radius=1.0, rate=0, burst=7, burst_frame=s.nova.frame_start, direction="RANDOM", speed=0.6)
+    ground(coll, 14)
+    return s
+
+
+def build_arcane_orb(context, coll):
+    """A floating orb: light orbits it in ribbons and arcs of lightning crackle out to the air around it."""
+    f0, f1 = context.scene.frame_start, context.scene.frame_end
+    c = (0, 0, 1.4)
+    s = new_system(context, coll, "Arcane Orb", [
+        dict(name="Orbit", color_mode="GRADIENT", color=(0.7, 0.35, 1.0), color2=(0.3, 0.8, 1.0), color_var=0.2,
+             life_min=1.5, life_max=3.0, size_start=0.005, size_end=0.002, gravity=0.0, drag_lin=2.0, emit=2.5,
+             emit_var=0.4, fade_in=0.1, fade_out=0.4, collide="NONE"),
+    ], display="RIBBONS", ribbon_frames=8, turb_amp=0.3, turb_freq=2.0)
+    # terminal orbit speed = spin / drag = 1.2 m/s; the pull supplies the v^2 / r that keeps them circling
+    emitter(coll, s, "Orbit Shell", "Orbit", c, size=0.6, shape="SPHERE", radius=0.6, rate=900,
+            direction="RANDOM", speed=0.2)
+    _force(coll, "Orb Spin", c, "VORTEX", s, strength=2.4, radius=0.0, size=0.7)
+    _force(coll, "Orb Pull", c, "ATTRACT", s, strength=2.6, radius=0.0)
+    core_mat = _plain_material("Nova Orb Core", (0.05, 0.02, 0.1), 0.2, (0.7, 0.4, 1.0), 25.0)
+    orb = _mesh(coll, "Orb", lambda bm: bmesh.ops.create_uvsphere(bm, u_segments=32, v_segments=16, radius=0.18),
+                c, mat=core_mat)
+    for p in orb.data.polygons:
+        p.use_smooth = True
+    # tendrils: short bolts from the orb to points in the air around it, one after another
+    import random
+    rng = random.Random(3)
+    frame = f0 + 6
+    i = 0
+    while frame < f1 - 10 and i < 10:
+        a, e = rng.uniform(0, 2 * math.pi), rng.uniform(-0.6, 0.9)
+        r = rng.uniform(0.9, 1.3)
+        tgt = _empty(coll, f"Arc Target {i + 1}", (c[0] + r * math.cos(a) * math.cos(e),
+                                                   c[1] + r * math.sin(a) * math.cos(e), c[2] + r * math.sin(e)),
+                     kind="PLAIN_AXES", size=0.05)
+        lightning.add(context, coll, c, name=f"Arc {i + 1}", target=tgt, ground=c[2] - 2.0, strike_frame=int(frame),
+                      leader_frames=2, strokes=2, stroke_gap=2.0, afterglow=5.0, radius=0.006, detail=2,
+                      roughness=0.3, branching=0.7, brightness=60.0, light_power=400.0, temperature=12000,
+                      seed=i * 11 + 2)
+        frame += rng.uniform(5, 14)
+        i += 1
+    return s
+
+
+def build_spirit_smoke(context, coll):
+    """Glowing spirit smoke: mist that shines cyan where it is fresh and fades to violet, with motes."""
+    s = new_system(context, coll, "Spirit Smoke", [
+        dict(name="Mote", color_mode="GRADIENT", color=(0.4, 0.9, 1.0), color2=(0.7, 0.3, 1.0), color_var=0.2,
+             life_min=1.5, life_max=3.0, size_start=0.006, size_end=0.0, gravity=0.0, drag_lin=0.5,
+             fluid_drag=2.0, emit=6.0, emit_var=0.5, twinkle_freq=4, twinkle_amt=0.5, fade_in=0.1, fade_out=0.5,
+             collide="NONE"),
+    ], turb_amp=0.5, turb_freq=1.5,
+        fluid=dict(buoy_heat=1.0, buoy_smoke=-0.05, vorticity=0.9, turb_amp=4.0, turb_freq=2.0, turb_speed=0.6,
+                   cool=0.5, cool_rad=0.0, burn_rate=0.0, smoke_decay=0.25, density_mult=4.0, flame_mult=8.0,
+                   gas_look="SPIRIT"))
+    domain(coll, s, (2.0, 2.0, 3.0), (0, 0, 1.5), 96)
+    emitter(coll, s, "Spirit Source", "Mote", (0, 0, 0.25), size=0.3, shape="SPHERE", radius=0.25, rate=80,
+            speed=0.3, speed_var=0.6, spread=0.8, fl_enabled=True, fl_density=1.2, fl_heat=0.8, fl_fuel=0.0,
+            fl_speed=0.6, fl_noise=0.7)
+    ground(coll, 12)
+    return s
+
+
 def build_empty(context, coll):
     s = new_system(context, coll, "Nova System", [
         dict(name="Particle", color_mode="BLACKBODY", temp0=2400, life_min=1, life_max=2, emit=20),
@@ -842,6 +1051,14 @@ PRESETS = [
     ("MELT", "Melting Text", "Wax letters soften under a moving heat lamp and slump into a puddle", build_melt),
     ("SLIME", "Slime", "A blob of slime drops onto steps and oozes down them", build_slime),
     ("BLOOD", "Blood", "Blood runs off a ledge and spreads into a pool", build_blood),
+    ("PORTAL", "Portal", "A spinning ring flings sparks while ribbons of light swirl inside it", build_portal),
+    ("SPELL", "Spell Circle", "Motes draw a turning spell circle on the ground; lights rise from it",
+     build_spell_circle),
+    ("WISPS", "Wisps", "Will-o'-wisps wander through the dark, drawing trails and shedding motes", build_wisps),
+    ("ORB", "Arcane Orb", "Light orbits a floating orb while arcs of lightning crackle out from it",
+     build_arcane_orb),
+    ("SPIRIT", "Spirit Smoke", "Glowing mist that shines where it is fresh and fades violet, with motes",
+     build_spirit_smoke),
     ("DISINTEGRATE", "Burn Away", "An object burns away along a ragged glowing front, shedding embers and ash",
      build_disintegrate),
     ("EMPTY", "Empty System", "One type, one emitter: start from scratch", build_empty),
@@ -876,6 +1093,11 @@ STAGES = {
     "LIGHTNING": ((0, -95, 7), (0, 0, 23), 30, True),
     "FORMATION": ((0, -9, 1.3), (0, 0, 1.2), 35, True),
     "DISINTEGRATE": ((0, -4.2, 1.3), (0, 0, 1.15), 45, True),
+    "PORTAL": ((0.6, -5.2, 1.4), (0, 0, 1.4), 35, True),
+    "SPELL": ((0, -3.6, 2.9), (0, 0, 0.1), 32, True),
+    "WISPS": ((0, -5.0, 1.3), (0, 0, 1.0), 35, True),
+    "ORB": ((0, -4.0, 1.5), (0, 0, 1.4), 40, True),
+    "SPIRIT": ((0, -5.5, 1.6), (0, 0, 1.4), 35, True),
     "LIQUID": ((0.4, -3.6, 1.5), (0, 0, 0.35), 32, "DAY"),
     "HONEY": ((0.0, -0.46, 0.13), (0, 0, 0.11), 35, "DAY"),
     "LAVA": ((0.5, -1.9, 1.0), (-0.3, 0, 0.3), 32, "DUSK"),
