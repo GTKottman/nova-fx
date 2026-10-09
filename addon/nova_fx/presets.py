@@ -510,6 +510,42 @@ def build_lightning(context, coll):
     return s
 
 
+def text_object(coll, name, body, size=1.0, loc=(0, 0, 0), rot=(math.radians(90), 0, 0)):
+    """A centred text object standing up facing -Y (the default front view), hidden in renders."""
+    cu = bpy.data.curves.new(name, "FONT")
+    cu.body = body
+    cu.align_x, cu.align_y = "CENTER", "CENTER"
+    cu.size = size
+    ob = bpy.data.objects.new(name, cu)
+    ob.location, ob.rotation_euler = loc, rot
+    ob.hide_render = True
+    ob.display_type = "WIRE"
+    coll.objects.link(ob)
+    return ob
+
+
+def build_formation(context, coll):
+    """Dust swirls in, assembles into a word, holds, and is released into the turbulence."""
+    s = new_system(context, coll, "Particle Logo", [
+        dict(name="Mote", color_mode="GRADIENT", color=(0.25, 0.65, 1.0), color2=(1.0, 0.35, 0.85), color_var=0.25,
+             color_curve=1.0, life_min=40, life_max=40, size_start=0.012, size_end=0.008, gravity=0.0,
+             drag_lin=0.8, emit=5.0, emit_var=0.5, twinkle_freq=4, twinkle_amt=0.4, fade_in=0.02, fade_out=0.05,
+             collide="NONE"),
+    ], turb_amp=1.2, turb_freq=0.7, turb_speed=0.4)
+    logo = text_object(coll, "Logo Text", "NOVA", size=1.6, loc=(0, 0, 1.2))
+    logo.nova_shape.mode, logo.nova_shape.points = "SURFACE", 30000
+    f0 = s.nova.frame_start
+    emitter(coll, s, "Dust Cloud", "Mote", (0, 0, 1.2), size=4.0, scale=(1.4, 0.6, 1.0), shape="SPHERE", radius=4.0,
+            rate=0, burst=30000, burst_frame=f0, direction="RANDOM", speed=0.4, speed_var=0.8)
+    form = _empty(coll, "Logo Form", (0, 0, 1.2), kind="PLAIN_AXES", size=0.6)
+    fc = form.nova_force
+    fc.enabled, fc.type, fc.target, fc.snap, fc.damping, fc.system = True, "FORM", logo, 2.5, 0.9, s
+    for frame, pull in ((f0, 0.0), (f0 + 20, 0.0), (f0 + 60, 1.0), (f0 + 140, 1.0), (f0 + 160, 0.0)):
+        fc.pull = pull
+        fc.keyframe_insert("pull", frame=frame)
+    return s
+
+
 def build_empty(context, coll):
     s = new_system(context, coll, "Nova System", [
         dict(name="Particle", color_mode="BLACKBODY", temp0=2400, life_min=1, life_max=2, emit=20),
@@ -533,6 +569,8 @@ PRESETS = [
     ("SNOW", "Snow", "Lit snowfall that settles", build_snow),
     ("LIGHTNING", "Lightning", "Branching cloud-to-ground strike: stepped leader, return strokes, afterglow",
      build_lightning),
+    ("FORMATION", "Particle Logo", "Dust assembles into a word (any text, logo or mesh), holds, then scatters",
+     build_formation),
     ("EMPTY", "Empty System", "One type, one emitter: start from scratch", build_empty),
 ]
 
@@ -563,6 +601,7 @@ STAGES = {
     "VORTEX": ((0, -8.5, 5.5), (0, 0, 0), 35, True),
     "SNOW": ((0, -14, 2.5), (0, 0, 2.5), 35, "DUSK"),
     "LIGHTNING": ((0, -95, 7), (0, 0, 23), 30, True),
+    "FORMATION": ((0, -9, 1.3), (0, 0, 1.2), 35, True),
     "EMPTY": ((0, -10, 3), (0, 0, 2), 35, False),
 }
 

@@ -234,6 +234,61 @@ def test_lightning():
     assert np.median(ms) < 200
 
 
+def _nearest(P, pts):
+    return np.sqrt(((P[:, None, :] - pts[None, :, :]) ** 2).sum(-1)).min(1)
+
+
+def test_form_force():
+    rng = np.random.default_rng(4)
+    pts = rng.normal(size=(200, 3)).astype(np.float32) * [3, 0.1, 1]  # a flat "logo" floating at z = 6
+    pts[:, 2] += 6
+    s = core.System()
+    s.set_params(dict(turb_amp=4.0))                                   # gravity and turbulence on
+    s.set_kinds([dict(life_min=100, life_max=100, drag_lin=0.5, collide=0)])
+    assert s.set_shape(0, pts) == 1
+    s.set_forces([[5, 0, 0, 0, 0, 0, 1, 1.0, 0, 4.0, 1.0, 0]])         # pull 1, snap 4, damping 1
+    s.emit(0, rng.normal(size=(3000, 3)) * 8, np.zeros((3000, 3)))
+    for _ in range(96):
+        s.frame(1 / 24, 2)
+    d = _nearest(s.export()[0], pts)
+    assert d.max() < 1e-3, d.max()
+    s.set_forces([[5, 0, 0, 0, 0, 0, 1, 0.5, 0, 4.0, 1.0, 0]])         # half pull: gravity sags them
+    for _ in range(48):
+        s.frame(1 / 24, 2)
+    sag = np.median(_nearest(s.export()[0], pts))
+    s.set_forces([[5, 0, 0, 0, 0, 0, 1, 0.0, 0, 4.0, 1.0, 0]])         # released: they fall
+    for _ in range(24):
+        s.frame(1 / 24, 2)
+    z = s.export()[0][:, 2].mean()
+    assert sag > 0.05 and z < 5.0, (sag, z)
+    print(f"form: 3000 particles on 200 points within {d.max() * 1e3:.2f} mm under gravity + turbulence; "
+          f"half pull sags {sag:.2f} m; released they fall (mean z {z:.1f})")
+
+
+def test_shape_burst():
+    rng = np.random.default_rng(5)
+    unit = rng.normal(size=(500, 3)).astype(np.float32)
+    unit /= np.linalg.norm(unit, axis=1).max()
+    s = core.System()
+    s.set_params(dict(gz=0.0))
+    # shell -> 400 stars in the shape; size = speed / linear drag = 12 / 3 = 4 m
+    s.set_kinds([dict(life_min=0.5, life_max=0.5, death_kind=1, death_count=400, death_pattern=8,
+                      death_shape=0, death_speed=12, death_speed_var=0, death_inherit=0, collide=0),
+                 dict(life_min=20, life_max=20, drag_lin=3.0, collide=0)])
+    s.set_shape(0, unit)
+    s.emit(0, [[0, 0, 10]], [[0, 0, 0]])
+    for _ in range(96):
+        s.frame(1 / 24, 4)
+    P = s.export()[0] - [0, 0, 10]
+    # stepping linear drag shrinks every path by the same factor (~1.6% at 4 substeps): the shape is exact,
+    # its size within a few percent of speed / drag
+    scale = np.linalg.norm(P, axis=1).max()
+    d = _nearest(P / scale, unit)
+    assert len(P) == 400 and d.max() < 1e-4 and abs(scale - 4) < 0.1, (len(P), d.max(), scale)
+    print(f"shape burst: 400 stars stop exactly in the shape (error {d.max() * 1e3:.3f} per mille), "
+          f"{scale:.2f} m for speed/drag = 4 m")
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and (len(sys.argv) < 2 or name in sys.argv[1:]):

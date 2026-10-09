@@ -35,6 +35,7 @@ _SIGS = {
     "nv_sys_set_fluid": (None, [_vp, _vp]),
     "nv_sys_set_colliders": (None, [_vp, C.c_int, _f]),
     "nv_sys_set_forces": (None, [_vp, C.c_int, _f]),
+    "nv_sys_set_shape": (C.c_int, [_vp, C.c_int, C.c_int, _f]),
     "nv_sys_set_sdf": (C.c_int, [_vp, C.c_int, C.c_int, C.c_int, C.c_int, C.c_float, C.c_float, C.c_float,
                                  C.c_float, _f]),
     "nv_sys_count": (C.c_int, [_vp]),
@@ -270,8 +271,14 @@ class System:
         lib().nv_sys_set_colliders(self.h, len(recs), fptr(a))
 
     def set_forces(self, recs):
-        a = np.ascontiguousarray(np.asarray(recs, np.float32).reshape(-1, 11)) if len(recs) else np.zeros((1, 11), np.float32)
+        """recs: [type, pos(3), axis(3), strength, radius, freq, falloff, shape slot] per force."""
+        a = np.ascontiguousarray(np.asarray(recs, np.float32).reshape(-1, 12)) if len(recs) else np.zeros((1, 12), np.float32)
         lib().nv_sys_set_forces(self.h, len(recs), fptr(a))
+
+    def set_shape(self, slot, pts):
+        """Store a point set (n, 3) in a shape slot (0-31) for Form forces and Shape bursts."""
+        p = np.ascontiguousarray(pts, np.float32).reshape(-1, 3)
+        return lib().nv_sys_set_shape(self.h, int(slot), len(p), fptr(p) if len(p) else None)
 
     def set_sdf(self, slot, origin, dx, dist):
         """dist: (nz, ny, nx) signed distances in the collider's local space; origin = sample (0,0,0)."""

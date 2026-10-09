@@ -145,6 +145,20 @@ def draw_kind_group(layout, k, n, gid):
             continue
         if name in {"hit_count", "hit_speed"} and not k.hit_kind:
             continue
+        if name == "death_shape":
+            if k.death_pattern == "SHAPE":
+                layout.prop(k, name, text="Shape")
+                if k.death_shape:
+                    draw_shape(layout, k.death_shape)
+                    if k.death_kind and k.death_kind in n.kinds:
+                        star = n.kinds[k.death_kind]
+                        if star.drag_lin > 0:
+                            layout.label(text=f"Shape size ≈ {k.death_speed / star.drag_lin:.1f} m "
+                                              f"(speed / {k.death_kind} linear drag)", icon="INFO")
+                        else:
+                            layout.label(text=f"Give {k.death_kind} linear drag so the stars stop in the shape",
+                                         icon="ERROR")
+            continue
         label = name.replace("_", " ").title()
         if t == "K":
             layout.prop_search(k, name, n, "kinds", text=label.replace(" Kind", ""), icon="PARTICLES")
@@ -331,11 +345,30 @@ class NOVA_PT_force(_Panel, bpy.types.Panel):
         f = context.object.nova_force
         layout.use_property_split = True
         layout.prop(f, "type")
+        layout.prop(f, "system")
+        if f.type == "FORM":
+            layout.prop(f, "target")
+            target = f.target or context.object
+            if target.type in {"MESH", "CURVE", "FONT", "SURFACE", "META", "CURVES"}:
+                draw_shape(layout, target)
+            else:
+                layout.label(text="Pick a mesh, text or curve to form", icon="ERROR")
+            layout.prop(f, "pull")
+            layout.prop(f, "snap")
+            layout.prop(f, "damping")
+            return
         layout.prop(f, "strength")
         layout.prop(f, "radius")
         layout.prop(f, "falloff")
         if f.type == "TURBULENCE":
             layout.prop(f, "freq")
+
+
+def draw_shape(layout, ob):
+    s = ob.nova_shape
+    col = layout.column(align=True)
+    col.prop(s, "mode")
+    col.prop(s, "points")
 
 
 def draw_trigger(layout, t, emitter=False):

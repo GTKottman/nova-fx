@@ -52,6 +52,8 @@ def _kind_annotations():
         elif t == "C":
             ann[name] = FloatVectorProperty(name=label, subtype="COLOR", size=3, min=0, soft_max=1,
                                             default=default, description=desc)
+        elif t == "O":
+            ann[name] = PointerProperty(name=label, type=bpy.types.Object, description=desc)
     return ann
 
 
@@ -259,12 +261,16 @@ class NovaCollider(bpy.types.PropertyGroup):
 
 class NovaForce(bpy.types.PropertyGroup):
     enabled: BoolProperty(default=False)
+    system: PointerProperty(name="System", type=bpy.types.Object, poll=_poll_system,
+                            description="Only this system feels the force (empty = every system)")
     type: EnumProperty(name="Type", items=[
         ("ATTRACT", "Attract", "Pull toward the object (negative pushes)"),
         ("VORTEX", "Vortex", "Swirl around the object's Z axis"),
         ("WIND", "Wind", "Moves air along local Z (acts through drag)"),
         ("TURBULENCE", "Turbulence", "Local curl noise"),
         ("DRAG", "Drag", "Slow particles down"),
+        ("FORM", "Form", "Pull every particle to its own point of a shape (logo, text, mesh): they assemble "
+                         "into it. Animate Pull to assemble and release"),
     ], default="ATTRACT")
     strength: FloatProperty(name="Strength", default=5.0, soft_min=-100, soft_max=100)
     radius: FloatProperty(name="Radius", default=0.0, min=0, soft_max=100, unit="LENGTH",
@@ -272,6 +278,15 @@ class NovaForce(bpy.types.PropertyGroup):
     falloff: FloatProperty(name="Falloff", default=2.0, min=0, soft_max=4,
                            description="0 = hard edge at radius, 2 = inverse square beyond radius")
     freq: FloatProperty(name="Scale", default=1.0, min=0.001, soft_max=20)
+    target: PointerProperty(name="Shape", type=bpy.types.Object,
+                            description="Object to form (empty = this object). Sampling: its Shape settings")
+    pull: FloatProperty(name="Pull", default=1.0, min=0, max=1,
+                        description="0 = free particles, 1 = held in the shape (gravity, wind and drag fade out). "
+                                    "Animate it to assemble and release")
+    snap: FloatProperty(name="Snap", default=3.0, min=0.01, soft_max=30,
+                        description="How fast particles reach their point (1/s): settled after about 6 / Snap seconds")
+    damping: FloatProperty(name="Damping", default=1.0, min=0, soft_max=3,
+                           description="1 = arrive without overshoot, below 1 = swing past and settle")
 
 
 CLASSES = (NovaKind, NovaFluid, NovaSystem, NovaEmitter, NovaCollider, NovaForce)
