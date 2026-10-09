@@ -666,6 +666,149 @@ def build_liquid(context, coll):
     return s
 
 
+def liquid_kind(name, color, viscosity=0.0, **kw):
+    d = dict(name=name, liquid=True, color_mode="FIXED", color=color, color_var=0.0, life_min=1e5, life_max=1e5,
+             size_start=0.004, size_end=0.004, size_var=0.0, emit=0.0, fade_in=0.0, fade_out=0.0, collide="BOUNCE",
+             viscosity=viscosity)
+    d.update(kw)
+    return d
+
+
+def liquid_system(context, coll, name, kinds, size, center, resolution, look, frame_end=None, **fluid):
+    s = new_system(context, coll, name, kinds, frame_end=frame_end, substeps=1, shading="LIT")
+    opts = dict(mode="LIQUID", look=look, flip=0.3, walls="TANK", cfl=3.0, max_sub=16)
+    opts.update(fluid)
+    domain(coll, s, size, center, resolution, **opts)
+    render.sync_liquid(s)  # the surface is sized from the domain's cells: set it up now that there is one
+    return s
+
+
+def nozzle(coll, s, name, kind, loc, radius, speed, dx, rot=(math.radians(180), 0, 0), **em):
+    """A liquid source that pours like a bottle: a sphere of the given radius, pointing along -Z by default,
+    emitting eight particles per cell of the stream it makes."""
+    rate = math.pi * radius * radius * speed / dx ** 3 * 8
+    return emitter(coll, s, name, kind, loc, rot, "SINGLE_ARROW", radius * 3, shape="SPHERE", radius=radius,
+                   direction="OBJECT_Z", spread=0.0, rate=rate, speed=speed, speed_var=0.0, nozzle=True, **em)
+
+
+def _light(coll, name, kind, energy, loc, target, size=1.0, color=(1, 1, 1)):
+    light = bpy.data.lights.new(name, kind)
+    light.energy, light.color = energy, color
+    if kind == "AREA":
+        light.size = size
+    ob = bpy.data.objects.new(name, light)
+    ob.location = loc
+    ob.rotation_euler = (Vector(target) - Vector(loc)).to_track_quat("-Z", "Y").to_euler()
+    coll.objects.link(ob)
+    return ob
+
+
+def build_honey(context, coll):
+    """Honey poured from 20 cm onto a plate: the rope buckles and coils as it lands (viscous coiling)."""
+    res, height = 100, 0.25
+    dx = height / res
+    s = liquid_system(context, coll, "Honey Pour", [
+        liquid_kind("Honey", (1.0, 0.6, 0.1), viscosity=100.0),
+    ], (0.16, 0.16, height), (0, 0, height / 2), res, "HONEY", visc_couple=2)
+    nozzle(coll, s, "Honey Nozzle", "Honey", (0, 0, 0.215), 0.005, 0.25, dx)
+    plate = _mesh(coll, "Plate", lambda bm: bmesh.ops.create_cone(bm, cap_ends=True, segments=48, radius1=0.075,
+                                                                   radius2=0.085, depth=0.006),
+                  (0, 0, 0.0), mat=_plain_material("Nova Plate", (0.9, 0.9, 0.88), 0.15))
+    for f in plate.data.polygons:
+        f.use_smooth = True
+    plate.location.z = -0.003
+    # a cream studio sweep behind: clear honey needs something light to glow against
+    sweep = _mesh(coll, "Backdrop", lambda bm: bmesh.ops.create_grid(bm, x_segments=1, y_segments=1, size=0.5),
+                  (0, 0.22, 0.2), (math.radians(90), 0, 0), _plain_material("Nova Backdrop", (0.85, 0.78, 0.66), 0.7))
+    sweep.scale = (1.2, 0.8, 1)
+    _light(coll, "Nova Key", "AREA", 30.0, (-0.25, -0.3, 0.35), (0, 0, 0.06), 0.25, (1.0, 0.92, 0.8))
+    _light(coll, "Nova Back", "AREA", 25.0, (0.1, 0.18, 0.3), (0, 0, 0.1), 0.15, (1.0, 0.8, 0.5))
+    return s
+
+
+def build_lava(context, coll):
+    """Lava from a vent runs down a slope: runny and bright where hot, a dark stiff crust where it cools."""
+    s = liquid_system(context, coll, "Lava Flow", [
+        liquid_kind("Lava", (1, 0.3, 0.05), viscosity=1.5, visc_temp=6.0, color_mode="BLACKBODY", temp0=1450,
+                    temp_var=40, cool=0.02, crust=0.4, conduct=0.6, emit=4.0),
+    ], (2.4, 1.2, 0.9), (0, 0, 0.45), 96, "LAVA", visc_couple=1, flip=0.2)
+    dx = 2.4 / 96
+    slope = _mesh(coll, "Slope", lambda bm: bmesh.ops.create_grid(bm, x_segments=1, y_segments=1, size=2.0),
+                  (0, 0, 0.22), (0, math.radians(14), 0), _plain_material("Nova Basalt", (0.03, 0.028, 0.027), 0.9))
+    slope.nova_collider.enabled, slope.nova_collider.shape = True, "PLANE"
+    nozzle(coll, s, "Lava Vent", "Lava", (-0.95, 0, 0.6), 0.08, 0.5, dx, rot=(0, math.radians(110), 0))
+    return s
+
+
+def build_melt(context, coll):
+    """Wax letters soften under a heat lamp and slump into a puddle."""
+    s = liquid_system(context, coll, "Melting Text", [
+        liquid_kind("Wax", (0.95, 0.85, 0.7), viscosity=1e6, visc_temp=60.0, color_mode="FIXED", temp0=300,
+                    temp_var=0.0, cool=0.0, conduct=1.2),
+    ], (2.0, 0.6, 0.9), (0, 0, 0.45), 100, "PARTICLE", visc_couple=1, flip=0.1)
+    word = text_object(coll, "Melting Word", "NOVA", size=0.55, loc=(0, 0, 0.24))
+    word.data.extrude = 0.06
+    context.view_layer.update()
+    me = bpy.data.meshes.new_from_object(word.evaluated_get(context.evaluated_depsgraph_get()))
+    solid = bpy.data.objects.new("Melting Word Volume", me)
+    solid.matrix_world = word.matrix_world.copy()
+    solid.hide_render, solid.display_type = True, "WIRE"
+    coll.objects.link(solid)
+    bpy.data.objects.remove(word)
+    dx = 2.0 / 100
+    corners = [solid.matrix_world @ Vector(c) for c in solid.bound_box]
+    ext = Vector([max(c[i] for c in corners) - min(c[i] for c in corners) for i in range(3)])
+    count = int(ext.x * ext.y * ext.z / dx ** 3 * 8 * 0.45)  # letters fill about 45% of their box
+    emitter(coll, s, "Melting Word Volume", "Wax", None, ob=solid, shape="VOLUME", rate=0, burst=count,
+            burst_frame=s.nova.frame_start, direction="RANDOM", speed=0.0, speed_var=0.0)
+    lamp = _empty(coll, "Heat Lamp", (-0.2, -0.1, 0.75), kind="CONE", size=0.15)
+    f = lamp.nova_force
+    f.enabled, f.type, f.system, f.temperature, f.heat_rate, f.radius, f.falloff = \
+        True, "HEAT", s, 700.0, 0.8, 0.45, 2.0
+    lamp.location.x = -0.9
+    lamp.keyframe_insert("location", frame=s.nova.frame_start)
+    lamp.location.x = 0.9
+    lamp.keyframe_insert("location", frame=s.nova.frame_start + 140)
+    _light(coll, "Nova Lamp Glow", "AREA", 80.0, (0, -0.8, 1.2), (0, 0, 0.2), 0.8, (1.0, 0.85, 0.65))
+    return s
+
+
+def build_slime(context, coll):
+    """A blob of slime drops onto a staircase and oozes down it."""
+    s = liquid_system(context, coll, "Slime", [
+        liquid_kind("Slime", (0.35, 1.0, 0.25), viscosity=25.0),
+    ], (1.4, 0.6, 1.1), (0, 0, 0.55), 96, "SLIME", visc_couple=2, flip=0.2)
+    dx = 1.4 / 96
+    step_mat = _plain_material("Nova Steps", (0.3, 0.3, 0.32), 0.6)
+    for i in range(4):
+        st = _mesh(coll, f"Step {i + 1}", lambda bm: bmesh.ops.create_cube(bm, size=1.0),
+                   (-0.45 + i * 0.3, 0, 0.3 - i * 0.075), mat=step_mat)
+        st.scale = (0.3, 0.58, 0.6 - i * 0.15)
+        st.location.z = (0.6 - i * 0.15) / 2
+        st.nova_collider.enabled, st.nova_collider.shape = True, "BOX"
+    blob = _mesh(coll, "Slime Blob", lambda bm: bmesh.ops.create_uvsphere(bm, u_segments=24, v_segments=12,
+                                                                          radius=0.16), (-0.5, 0, 0.95))
+    blob.hide_render, blob.display_type = True, "WIRE"
+    count = int(4.18879 * 0.16 ** 3 / dx ** 3 * 8)
+    emitter(coll, s, "Slime Blob", "Slime", None, ob=blob, shape="VOLUME", rate=0, burst=count,
+            burst_frame=s.nova.frame_start, direction="RANDOM", speed=0.0, speed_var=0.0)
+    return s
+
+
+def build_blood(context, coll):
+    """A pool of blood wells up on a tiled floor and creeps across it. Pools are only millimetres thick, so this
+    is a small, flat, fine domain (3 mm cells); a slight tilt of gravity makes it creep one way."""
+    s = liquid_system(context, coll, "Blood", [
+        liquid_kind("Blood", (0.25, 0.0, 0.01), viscosity=0.05),  # stage blood: thicker than the real thing
+    ], (0.6, 0.6, 0.06), (0, 0, 0.03), 200, "BLOOD", visc_couple=1, flip=0.3, walls="TANK", surface_smooth=14)
+    s.nova.gravity = (9.81 * math.sin(math.radians(3)), 0.0, -9.81 * math.cos(math.radians(3)))
+    dx = 0.6 / 200
+    _mesh(coll, "Floor", lambda bm: bmesh.ops.create_grid(bm, x_segments=10, y_segments=10, size=0.6),
+          (0, 0, 0.0), mat=_plain_material("Nova Tiles", (0.55, 0.55, 0.53), 0.3))
+    nozzle(coll, s, "Blood Source", "Blood", (-0.18, 0.02, 0.02), 0.014, 0.12, dx)
+    return s
+
+
 def build_empty(context, coll):
     s = new_system(context, coll, "Nova System", [
         dict(name="Particle", color_mode="BLACKBODY", temp0=2400, life_min=1, life_max=2, emit=20),
@@ -693,6 +836,12 @@ PRESETS = [
      build_formation),
     ("LIQUID", "Splash Tank", "FLIP liquid: a column of water falls around an obstacle and sloshes in a tank",
      build_liquid),
+    ("HONEY", "Honey Pour", "Thick honey poured onto a plate: the stream buckles and coils as it lands",
+     build_honey),
+    ("LAVA", "Lava Flow", "Glowing lava runs down a slope and grows a dark crust as it cools", build_lava),
+    ("MELT", "Melting Text", "Wax letters soften under a moving heat lamp and slump into a puddle", build_melt),
+    ("SLIME", "Slime", "A blob of slime drops onto steps and oozes down them", build_slime),
+    ("BLOOD", "Blood", "Blood runs off a ledge and spreads into a pool", build_blood),
     ("DISINTEGRATE", "Burn Away", "An object burns away along a ragged glowing front, shedding embers and ash",
      build_disintegrate),
     ("EMPTY", "Empty System", "One type, one emitter: start from scratch", build_empty),
@@ -728,6 +877,11 @@ STAGES = {
     "FORMATION": ((0, -9, 1.3), (0, 0, 1.2), 35, True),
     "DISINTEGRATE": ((0, -4.2, 1.3), (0, 0, 1.15), 45, True),
     "LIQUID": ((0.4, -3.6, 1.5), (0, 0, 0.35), 32, "DAY"),
+    "HONEY": ((0.0, -0.46, 0.13), (0, 0, 0.11), 35, "DAY"),
+    "LAVA": ((0.5, -1.9, 1.0), (-0.3, 0, 0.3), 32, "DUSK"),
+    "MELT": ((0, -2.4, 0.7), (0, 0, 0.25), 40, "DUSK"),
+    "SLIME": ((0.9, -2.2, 1.2), (0, 0, 0.35), 32, "DAY"),
+    "BLOOD": ((0.15, -0.55, 0.38), (0.0, 0, 0.0), 35, "DAY"),
     "EMPTY": ((0, -10, 3), (0, 0, 2), 35, False),
 }
 

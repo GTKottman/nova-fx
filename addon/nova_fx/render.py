@@ -1,6 +1,7 @@
 """Materials, streak display (Geometry Nodes) and glow for Nova systems."""
 
 import bpy
+from mathutils import Vector
 
 PMAT = "Nova Particles"
 VMAT = "Nova Fire"
@@ -320,19 +321,21 @@ WATER = "Nova Water"
 def liquid_tree():
     """Points marked nova_liquid -> signed distance grid -> Laplacian smoothing -> mesh."""
     tree = bpy.data.node_groups.get(LIQ_TREE)
-    if tree is not None and tree.get("nova_v") == 3:
+    if tree is not None and tree.get("nova_v") == 5:
         return tree
     if tree is None:
         tree = bpy.data.node_groups.new(LIQ_TREE, "GeometryNodeTree")
     tree.nodes.clear()
     tree.interface.clear()
-    tree["nova_v"] = 3
+    tree["nova_v"] = 5
     for name, kind, in_out, default in (("Geometry", "NodeSocketGeometry", "INPUT", None),
                                         ("System", "NodeSocketObject", "INPUT", None),
                                         ("Radius", "NodeSocketFloat", "INPUT", 0.035),
                                         ("Voxel Size", "NodeSocketFloat", "INPUT", 0.025),
                                         ("Smoothing", "NodeSocketInt", "INPUT", 8),
                                         ("Offset", "NodeSocketFloat", "INPUT", -0.01),
+                                        ("Box Min", "NodeSocketVector", "INPUT", (-1e4, -1e4, -1e4)),
+                                        ("Box Max", "NodeSocketVector", "INPUT", (1e4, 1e4, 1e4)),
                                         ("Material", "NodeSocketMaterial", "INPUT", None),
                                         ("Geometry", "NodeSocketGeometry", "OUTPUT", None)):
         s = tree.interface.new_socket(name, in_out=in_out, socket_type=kind)
@@ -365,8 +368,43 @@ def liquid_tree():
     L(gi.outputs["Offset"], shrink.inputs["Distance"])
     mesh = N("GeometryNodeGridToMesh")
     L(shrink.outputs[0], mesh.inputs["Grid"])
+    # carry the nearest particle's colour and glow onto the surface (lava glows where it is hot)
+    near = N("GeometryNodeSampleNearest")
+    near.domain = "POINT"
+    L(dele.outputs[0], near.inputs["Geometry"])
+    L(N("GeometryNodeInputPosition").outputs[0], near.inputs["Sample Position"])
+    carried = mesh.outputs[0]
+    for name, dtype in (("Cd", "FLOAT_VECTOR"), ("emit", "FLOAT")):
+        get = N("GeometryNodeInputNamedAttribute")
+        get.data_type = dtype
+        get.inputs["Name"].default_value = name
+        pick = N("GeometryNodeSampleIndex")
+        pick.data_type, pick.domain = dtype, "POINT"
+        L(dele.outputs[0], pick.inputs["Geometry"])
+        L(get.outputs["Attribute"], pick.inputs["Value"])
+        L(near.outputs["Index"], pick.inputs["Index"])
+        put = N("GeometryNodeStoreNamedAttribute")
+        put.data_type, put.domain = dtype, "POINT"
+        put.inputs["Name"].default_value = name
+        L(carried, put.inputs["Geometry"])
+        L(pick.outputs["Value"], put.inputs["Value"])
+        carried = put.outputs[0]
+    # smoothing rounds a flat body of water out through the floor and walls where there are no particles to
+    # hold it: keep the surface inside the domain, so water sits flat on the floor and against the walls
+    pos = N("GeometryNodeInputPosition").outputs[0]
+    lo = N("ShaderNodeVectorMath")
+    lo.operation = "MAXIMUM"
+    L(pos, lo.inputs[0])
+    L(gi.outputs["Box Min"], lo.inputs[1])
+    hi = N("ShaderNodeVectorMath")
+    hi.operation = "MINIMUM"
+    L(lo.outputs[0], hi.inputs[0])
+    L(gi.outputs["Box Max"], hi.inputs[1])
+    clip = N("GeometryNodeSetPosition")
+    L(carried, clip.inputs["Geometry"])
+    L(hi.outputs[0], clip.inputs["Position"])
     shade = N("GeometryNodeSetShadeSmooth")
-    L(mesh.outputs[0], shade.inputs["Mesh"])
+    L(clip.outputs[0], shade.inputs["Mesh"])
     mat = N("GeometryNodeSetMaterial")
     L(shade.outputs[0], mat.inputs["Geometry"])
     L(gi.outputs["Material"], mat.inputs["Material"])
@@ -384,6 +422,63 @@ def liquid_tree():
     L(mat.outputs[0], sw.inputs["True"])
     L(sw.outputs[0], go.inputs["Geometry"])
     return tree
+
+
+LOOKS = {
+    # look: (base colour, roughness, transmission, IOR, absorption colour, absorption density, SSS weight)
+    "WATER": ((0.85, 0.93, 1.0), 0.02, 1.0, 1.333, None, 0.0, 0.0),
+    "HONEY": ((1.0, 0.95, 0.85), 0.05, 1.0, 1.49, (1.0, 0.9, 0.12), 120.0, 0.0),  # gold at 1 cm, amber deeper
+    "BLOOD": ((0.05, 0.0, 0.002), 0.12, 0.0, 1.4, None, 0.0, 0.0),  # near-black red, wet gloss
+    "CHOCOLATE": ((0.11, 0.045, 0.02), 0.25, 0.0, 1.45, None, 0.0, 0.1),
+    "SLIME": ((0.35, 1.0, 0.25), 0.12, 0.85, 1.38, (0.3, 1.0, 0.15), 8.0, 0.0),
+}
+
+
+def liquid_material(look):
+    """The surface material for a liquid look. Lava and Particle Colours read the carried Cd/emit."""
+    if look == "WATER":
+        return water_material()
+    name = f"Nova {look.title()}"
+    mat = bpy.data.materials.get(name)
+    if mat is not None:
+        return mat
+    mat = bpy.data.materials.new(name)
+    mat.use_nodes = True
+    nt = mat.node_tree
+    b = next(n for n in nt.nodes if n.type == "BSDF_PRINCIPLED")
+    out = next(n for n in nt.nodes if n.type == "OUTPUT_MATERIAL")
+    if look in {"LAVA", "PARTICLE"}:
+        cd = nt.nodes.new("ShaderNodeAttribute")
+        cd.attribute_type, cd.attribute_name = "GEOMETRY", "Cd"
+        em = nt.nodes.new("ShaderNodeAttribute")
+        em.attribute_type, em.attribute_name = "GEOMETRY", "emit"
+        nt.links.new(cd.outputs["Color"], b.inputs["Emission Color"])
+        nt.links.new(em.outputs["Fac"], b.inputs["Emission Strength"])
+        if look == "LAVA":  # cooled rock: black and rough; the glow comes through where it is hot
+            b.inputs["Base Color"].default_value = (0.02, 0.018, 0.017, 1)
+            b.inputs["Roughness"].default_value = 0.85
+        else:
+            nt.links.new(cd.outputs["Color"], b.inputs["Base Color"])
+        mat.diffuse_color = (0.6, 0.15, 0.02, 1)
+        return mat
+    col, rough, trans, ior, absorb, dens, sss = LOOKS[look]
+    b.inputs["Base Color"].default_value = (*col, 1)
+    b.inputs["Roughness"].default_value = rough
+    b.inputs["Transmission Weight"].default_value = trans
+    b.inputs["IOR"].default_value = ior
+    if sss:
+        b.inputs["Subsurface Weight"].default_value = sss
+        b.inputs["Subsurface Radius"].default_value = (0.02, 0.004, 0.003)
+    if absorb is not None:  # colour deepens with thickness, like a jar of honey
+        vol = nt.nodes.new("ShaderNodeVolumeAbsorption")
+        vol.inputs["Color"].default_value = (*absorb, 1)
+        vol.inputs["Density"].default_value = dens
+        nt.links.new(vol.outputs[0], out.inputs["Volume"])
+    if look == "SLIME":
+        b.inputs["Emission Color"].default_value = (0.3, 1.0, 0.2, 1)
+        b.inputs["Emission Strength"].default_value = 0.15
+    mat.diffuse_color = (*col, 0.8)
+    return mat
 
 
 def water_material():
@@ -419,22 +514,32 @@ def sync_liquid(sysob):
         fl.surface = sob
     sob.hide_render = sob.hide_viewport = False
     mod = sob.modifiers.get("Nova Surface") or sob.modifiers.new("Nova Surface", "NODES")
-    if mod.node_group is None or mod.node_group.get("nova_v") != 3:
+    if mod.node_group is None or mod.node_group.get("nova_v") != 5:
         mod.node_group = liquid_tree()
     dx = 0.05
+    box = None
     if fl.domain:
         from . import sim
         try:
             _res, dx, _o = sim.fluid_layout(sysob)
+            box = sim.domain_box(fl.domain)
         except Exception:
             pass
+    if box is not None:  # in the surface object's space (it sits on the system)
+        inv = sysob.matrix_world.inverted()
+        lo, hi = inv @ Vector(box[0]), inv @ Vector(box[1])
+        _mod_input(mod, "Box Min", tuple(min(a, b) for a, b in zip(lo, hi)))
+        _mod_input(mod, "Box Max", tuple(max(a, b) for a, b in zip(lo, hi)))
     _mod_input(mod, "System", sysob)
     _mod_input(mod, "Radius", float(fl.surface_radius * dx))
     _mod_input(mod, "Voxel Size", float(dx * 0.5))
     _mod_input(mod, "Smoothing", int(fl.surface_smooth))
     _mod_input(mod, "Offset", float(-max(0.0, fl.surface_radius - 0.9) * dx))
+    mat = liquid_material(fl.look)
     if not sob.data.materials:
-        sob.data.materials.append(water_material())
+        sob.data.materials.append(mat)
+    elif sob.data.materials[0] is None or sob.data.materials[0].name.startswith("Nova "):
+        sob.data.materials[0] = mat  # follow the Look unless the user put their own material on
     _mod_input(mod, "Material", sob.data.materials[0])
     sob.matrix_world = sysob.matrix_world.copy()
     # the water is the surface: the points stay for the viewport, out of the render

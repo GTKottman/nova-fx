@@ -44,6 +44,11 @@ make -C core
 | Snow | Lit flakes that settle |
 | Particle Logo | Dust assembles into a word (any text, logo or mesh) with the Form force, holds, then scatters |
 | Splash Tank | FLIP liquid: a column of water falls, wraps around a ball and sloshes in a tank |
+| Honey Pour | Thick honey poured onto a plate: the stream buckles and coils as it lands |
+| Lava Flow | Lava runs down a slope, glowing where hot, a dark crust where it cools |
+| Melting Text | Wax letters soften under a moving heat lamp and slump into a puddle |
+| Slime | A blob of slime drops onto steps and oozes down them |
+| Blood | A pool of blood wells up and creeps across a tiled floor |
 | Burn Away | An object disintegrates along a ragged glowing front, shedding embers and ash |
 | Lightning | Cloud-to-ground strike grown by the dielectric breakdown model: stepped leader, return strokes, cooling afterglow, impact spatter. With *Camera, World & Glow*, a cloud deck the flash lights from inside |
 | Empty System | Starting point |
@@ -229,6 +234,41 @@ music triggers and events.
   Bake skips the surface and it is meshed for display. Blender 5.2 crashes meshing zero points, so the
   tree only meshes when there are some.
 - **Example:** [`examples/splash_tank.py`](examples/splash_tank.py).
+
+### Thick liquids: honey, lava, melting
+Particle types now have a **viscosity** (Pa·s: water 0.001, blood 0.004, honey 10, chocolate 25), and the
+liquid's **Look** sets the surface material: Water, Honey, Blood, Chocolate, Slime, Lava or the particles' own
+colours.
+- **Viscosity solve:** Batty & Bridson 2008, *Accurate viscous free surfaces for buckling, coiling and rotating
+  liquids*. Each substep minimises Σ ρV(u − u*)²/2 + Δt Σ μV|D(u)|², where D is the strain rate. Normal strain
+  sits at cell centres and shear on cell edges, as the MAC grid places them.
+  - The control-volume weights V are liquid fractions, so the free surface is stress-free by itself; that is
+    what lets a falling rope buckle and coil.
+  - Solids count as full in the edge weights, which makes walls no-slip.
+  - It is solved matrix-free with Jacobi-preconditioned CG, on a box around the liquid and a compact list of
+    unknown faces.
+  - Air faces next to the liquid are unknowns too, with zero mass. Holding them at extrapolated values grips
+    the surface: a spinning 500 Pa·s blob kept 57% of its angular momentum that way. Free, it keeps 88–90%
+    against 91–95% inviscid.
+- **Coupling:** viscosity and pressure solves alternate (*Coupling*, default 2). That moves toward the coupled
+  Stokes solve of Larionov, Batty & Bridson 2017 (*Variational Stokes*), which shows that split solves lose
+  coiling. With one pass the honey folded chaotically; with alternating passes it lays down loops.
+- **Nozzles:** a liquid emitter can hold its liquid at the emit velocity, like the mouth of a bottle. A viscous
+  stream is under tension; a free source gets yanked down by the rope below and the stream comes in segments.
+  The mouth emits on a disc, and sub-frame timing spreads each frame's births evenly along the stream.
+- **Heat:** *Visc Temp* thins a type as it warms (μ × e^(k (T₀ − T)/1000 K)). *Conduct* spreads heat between
+  neighbouring particles, and *Crust* cools the surface only. A new **Heat** force pulls particles toward a
+  temperature.
+  - Above 10⁴ Pa·s a particle is frozen: solid, it does not move. The solve caps viscosity at 10³ Pa·s, so it
+    stays fast.
+  - Melting is a cold, frozen block with a heat lamp; lava is a hot, runny type with a crust.
+- **Volume kept:** FLIP particles drift apart over time; the honey doubled its volume without a fix. Interior
+  cells that are too sparse (or crowded) get a small target convergence (or expansion) in the pressure solve,
+  measured against the liquid's own density when it first appeared.
+- **Surface:** carries the nearest particle's colour and glow (so lava glows where it is hot), and is clipped
+  to the domain: smoothing would otherwise round flat water out through the floor.
+- **Measured:** water spreads 1.08 m in 0.5 s, 5 Pa·s 0.75 m, 50 Pa·s 0.39 m. A frozen block stays put;
+  heated to 700 K it runs. The Honey Pour runs about 1 s per frame at 2.5 mm cells.
 
 ### Upres
 *Fire & Smoke → Upres* writes the fire 2–4 times finer than it is simulated. The method is guided detail
@@ -418,6 +458,7 @@ Same plume, empty domain grown from 64³ to 256³ (old → now):
 python3 tests/test_core.py                                     # core: correctness + speed, ~7 s
 blender -b --factory-startup --python tests/blender_presets.py -- --frames 24
 blender -b --factory-startup --python tests/blender_lightning.py   # bolt controls, target, timeline
+blender -b --factory-startup --python tests/blender_viscous.py    # nozzle, thin honey stream, looks, melting under a lamp
 blender -b --factory-startup --python tests/blender_liquid.py     # FLIP tank: kept, inside, around the ball, meshed
 blender -b --factory-startup --python tests/blender_upres.py      # fine VDBs: voxel size, smoke total, detail
 blender -b --factory-startup --python tests/blender_dissolve.py    # mask, material, particles and flames agree
@@ -429,8 +470,8 @@ blender -b --factory-startup --python tests/blender_render.py -- FIREWORKS 260 o
 
 ## Researched, not built (yet)
 
-Liquids still to come: viscosity (honey, lava), whitewater (spray, foam, bubbles), surface tension, and the
-liquid solver on the GPU.
+Liquids still to come: whitewater (spray, foam, bubbles), surface tension and elasticity (slime is only
+viscous), APIC transfers, a multigrid preconditioner for the viscosity solve, and the liquid solver on the GPU.
 
 From the paid tools (X-Particles, tyFlow, EmberGen, Pro Pyro, VFX Pro Simulations):
 - APIC liquids (FLIP/PIC is built), granular, cloth

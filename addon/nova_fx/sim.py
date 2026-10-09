@@ -121,7 +121,8 @@ def apply_params(rt, scene, sysob):
         vals.update(wind_x=fl.wind[0], wind_y=fl.wind[1], wind_z=fl.wind[2], seed=n.seed)
         if fl.mode == "LIQUID":
             walls = ["OPEN", "TANK", "BOX"].index(fl.walls)
-            vals.update(liquid=1.0, flip=fl.flip, walls=float(walls), closed_floor=float(walls > 0), sparse=1.0)
+            vals.update(liquid=1.0, flip=fl.flip, walls=float(walls), closed_floor=float(walls > 0), sparse=1.0,
+                        visc_couple=float(fl.visc_couple), visc_iter=float(fl.visc_iter))
         rt.fluid.set_params(vals)
 
 
@@ -253,6 +254,25 @@ def collider_records(rt, scene, dt, depsgraph=None, frame=0):
     return recs
 
 
+def inflow_records(rt, scene, sysob, frame):
+    """Nozzles: liquid emitters that hold their liquid at the emit velocity while it is inside them."""
+    if not rt.fluid or sysob.nova.fluid.mode != "LIQUID":
+        return []
+    names = [k.name for k in sysob.nova.kinds]
+    recs = []
+    for ob in emitters_of(scene, sysob):
+        em = ob.nova_emitter
+        if not em.nozzle or em.kind not in names or not sysob.nova.kinds[em.kind].liquid:
+            continue
+        if not (em.frame_start <= frame <= em.frame_end) or em.shape not in {"POINT", "SPHERE"}:
+            continue
+        mw = ob.matrix_world
+        r = (em.radius * max(mw.to_scale()) if em.shape == "SPHERE" else 0.0) + 1.5 * rt.fluid.dx
+        z = (mw.to_3x3() @ Vector((0, 0, 1))).normalized()
+        recs.append([*mw.to_translation(), r, *(z * em.speed)])
+    return recs[:16]
+
+
 def ensure_shape(rt, ob, purpose, depsgraph=None):
     """Upload the object's sampled points to a shape slot (only when they change); returns the slot or -1.
     purpose "form": world-space points; "burst": unit directions turned like the object."""
@@ -275,7 +295,7 @@ def ensure_shape(rt, ob, purpose, depsgraph=None):
 
 
 def force_records(rt, scene, depsgraph=None, sysob=None):
-    types = {"ATTRACT": 0, "VORTEX": 1, "WIND": 2, "TURBULENCE": 3, "DRAG": 4, "FORM": 5}
+    types = {"ATTRACT": 0, "VORTEX": 1, "WIND": 2, "TURBULENCE": 3, "DRAG": 4, "FORM": 5, "HEAT": 6}
     recs = []
     for ob in scene.objects:
         f = ob.nova_force
@@ -290,6 +310,9 @@ def force_records(rt, scene, depsgraph=None, sysob=None):
             slot = ensure_shape(rt, target, "form", depsgraph)
             if slot >= 0:
                 recs.append([5, *mw.to_translation(), *axis, f.pull, 0.0, f.snap, f.damping, slot])
+            continue
+        if f.type == "HEAT":
+            recs.append([6, *mw.to_translation(), *axis, f.temperature, f.radius, f.heat_rate, f.falloff, 0])
             continue
         recs.append([types[f.type], *mw.to_translation(), *axis, f.strength, f.radius, f.freq, f.falloff, 0])
     return recs
@@ -345,7 +368,7 @@ def _volume_points(st, ob, depsgraph, n, rng):
     me = ob.data
     key = (me.name, len(me.vertices), tuple(round(v, 5) for c in ob.bound_box for v in c))
     if st.get("vol_key") != key:
-        origin, dx, dist = bake_sdf(ob, depsgraph, 40)
+        origin, dx, dist = bake_sdf(ob, depsgraph, 72)  # fine enough for letters and their holes
         st["vol_key"], st["vol_sdf"] = key, (np.array(origin, np.float32), dx, dist)
     origin, dx, dist = st["vol_sdf"]
     nz, ny, nx = dist.shape
@@ -404,6 +427,13 @@ def sample_local(em, st, ob, depsgraph, n, rng):
         a, b, c = co[tri[t, 0]], co[tri[t, 1]], co[tri[t, 2]]
         p = a + (b - a) * u[:, None] + (c - a) * v[:, None]
         return p.astype(np.float32), st["tri_n"][t].astype(np.float32)
+    if em.shape == "SPHERE" and em.nozzle:
+        # a nozzle's mouth: a disc across the flow. The births' sub-frame times spread them evenly along the
+        # stream (emit_frame moves each one by its pre-age), so the stream has no per-frame lumps
+        a = rng.random(n) * 2 * np.pi
+        r = em.radius * np.sqrt(rng.random(n))
+        p = np.stack([r * np.cos(a), r * np.sin(a), np.zeros(n)], 1).astype(np.float32)
+        return p, np.tile(np.array([0, 0, 1], np.float32), (n, 1))
     if em.shape == "SPHERE":
         d = _random_dirs(n, rng)
         r = em.radius * np.cbrt(rng.random(n))
@@ -505,6 +535,9 @@ def emit_frame(rt, scene, sysob, frame, dt, depsgraph):
             if em.inherit != 0 and dt > 0:
                 vel += (pw1 - pw0) / dt * em.inherit
             preage = ((1 - t) * dt).astype(np.float32)
+            if em.nozzle:  # inside a nozzle nothing falls: the head start is along the nozzle velocity only
+                pos = pos + vel * preage[:, None]
+                preage = np.zeros_like(preage)
             if life is not None and n_music:
                 # only the music births get the exact lifetime
                 lf = np.full(n, -1.0, np.float32)
@@ -613,6 +646,9 @@ def upres_frame(rt, sysob, dt):
 
 
 def reset(rt, scene, sysob):
+    if sysob.nova.fluid.enabled and sysob.nova.fluid.mode == "LIQUID":
+        from . import render
+        render.sync_liquid(sysob)  # domain or resolution may have changed since: resize the surface
     rt.sys.reset()
     ensure_fluid(rt, sysob)
     if rt.upres:
@@ -636,12 +672,14 @@ def step(scene, sysob, frame, depsgraph=None, write=True):
         apply_params(rt, scene, sysob)
         rt.sys.set_colliders(collider_records(rt, scene, dt, depsgraph, frame))
         rt.sys.set_forces(force_records(rt, scene, depsgraph, sysob))
+        rt.sys.set_inflows(inflow_records(rt, scene, sysob, frame))
         emit_frame(rt, scene, sysob, frame, dt, depsgraph)
     else:
         ensure_fluid(rt, sysob)
         apply_params(rt, scene, sysob)
         rt.sys.set_colliders(collider_records(rt, scene, dt, depsgraph, frame))
         rt.sys.set_forces(force_records(rt, scene, depsgraph, sysob))
+        rt.sys.set_inflows(inflow_records(rt, scene, sysob, frame))
         # sources first (they feed this frame's fluid step), then move, then the new births
         rt.sys.frame(dt, n.substeps, rt.fluid)
         upres_frame(rt, sysob, dt)

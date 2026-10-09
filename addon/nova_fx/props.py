@@ -112,6 +112,19 @@ def _fluid_annotations():
     ], default="GAS", update=lambda s, c: _liquid_update(s, c))
     ann["flip"] = FloatProperty(name="FLIP", default=0.95, min=0, max=1,
                                 description="1 = lively splashes (pure FLIP), 0 = calm and damped (PIC)")
+    ann["visc_couple"] = IntProperty(name="Coupling", default=2, min=1, max=4,
+                                     description="Viscosity and pressure solves per step. More passes approach the "
+                                                 "coupled Stokes solve (Larionov et al. 2017): cleaner coiling, slower")
+    ann["visc_iter"] = IntProperty(name="Viscosity Iterations", default=300, min=10, max=5000)
+    ann["look"] = EnumProperty(name="Look", items=[
+        ("WATER", "Water", "Clear, refracting"),
+        ("HONEY", "Honey", "Amber and translucent"),
+        ("BLOOD", "Blood", "Deep red, glossy"),
+        ("CHOCOLATE", "Chocolate", "Brown, glossy, opaque"),
+        ("SLIME", "Slime", "Green, translucent, glowing faintly"),
+        ("LAVA", "Lava", "Glows by temperature under a dark crust"),
+        ("PARTICLE", "Particle Colours", "Each particle's own colour and glow carried onto the surface"),
+    ], default="WATER", update=lambda s, c: _liquid_update(s, c))
     ann["walls"] = EnumProperty(name="Walls", items=[
         ("OPEN", "Open", "Liquid leaving the domain is gone"),
         ("TANK", "Tank", "Floor and sides are walls, the top is open"),
@@ -246,6 +259,9 @@ class NovaEmitter(bpy.types.PropertyGroup):
         ("DISSOLVE", "Dissolve Front", "Where a disintegrating object burns away: Rate = particles per square "
                                        "metre that disappears"),
     ], default="POINT")
+    nozzle: BoolProperty(name="Nozzle", default=False,
+                         description="Liquid: hold the liquid inside the emitter at the emit velocity, like the mouth "
+                                     "of a bottle. The stream below can pull on it but not speed it up")
     dissolve_source: PointerProperty(name="Burning Object", type=bpy.types.Object,
                                      description="The disintegrating object (empty = this object)")
     radius: FloatProperty(name="Radius", default=0.1, min=0, soft_max=10, unit="LENGTH")
@@ -312,6 +328,8 @@ class NovaForce(bpy.types.PropertyGroup):
         ("DRAG", "Drag", "Slow particles down"),
         ("FORM", "Form", "Pull every particle to its own point of a shape (logo, text, mesh): they assemble "
                          "into it. Animate Pull to assemble and release"),
+        ("HEAT", "Heat", "Warm (or chill) particles toward a temperature: melts solids made of thick liquid, "
+                         "keeps lava runny"),
     ], default="ATTRACT")
     strength: FloatProperty(name="Strength", default=5.0, soft_min=-100, soft_max=100)
     radius: FloatProperty(name="Radius", default=0.0, min=0, soft_max=100, unit="LENGTH",
@@ -326,6 +344,10 @@ class NovaForce(bpy.types.PropertyGroup):
                                     "Animate it to assemble and release")
     snap: FloatProperty(name="Snap", default=3.0, min=0.01, soft_max=30,
                         description="How fast particles reach their point (1/s): settled after about 6 / Snap seconds")
+    temperature: FloatProperty(name="Temperature", default=1200.0, min=0, soft_max=4000,
+                               description="Heat: the temperature particles are pulled toward (K)")
+    heat_rate: FloatProperty(name="Rate", default=1.0, min=0, soft_max=20,
+                             description="Heat: how fast they get there (1/s), fading with distance by Falloff")
     damping: FloatProperty(name="Damping", default=1.0, min=0, soft_max=3,
                            description="1 = arrive without overshoot, below 1 = swing past and settle")
 
