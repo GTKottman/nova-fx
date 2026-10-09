@@ -150,7 +150,10 @@ def _fluid_annotations():
         ("FIRE", "Fire & Smoke", "Flame glows by temperature, smoke absorbs"),
         ("SPIRIT", "Spirit", "Glowing mist: it shines where it is dense, coloured from Color to End Color as "
                              "its heat fades"),
+        ("INK", "Ink", "Dye in water: the smoke absorbs light in Ink Color, nothing glows"),
     ], default="FIRE", update=lambda s, c: _material_update(s, c))
+    ann["ink_color"] = FloatVectorProperty(name="Ink Color", subtype="COLOR", size=3, min=0, max=1,
+                                           default=(0.04, 0.1, 0.55), update=lambda s, c: _material_update(s, c))
     ann["spirit_color"] = FloatVectorProperty(name="Color", subtype="COLOR", size=3, min=0, max=1,
                                               default=(0.35, 0.85, 1.0), update=lambda s, c: _material_update(s, c))
     ann["spirit_color2"] = FloatVectorProperty(name="End Color", subtype="COLOR", size=3, min=0, max=1,

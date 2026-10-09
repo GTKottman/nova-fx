@@ -1951,6 +1951,7 @@ typedef struct NvSys {
   double time, ms;
   /* scratch */
   uint16_t *ev_trail, *ev_death;
+  float *ev_n; /* normal of the surface a particle hit this step (3 per particle) */
   uint8_t *ev_split, *ev_hit, *dead;
   uint32_t *cnt, *off;
   int scap;
@@ -2047,7 +2048,7 @@ API void nv_sys_free(NvSys *s) {
   pb_free(&s->p);
   pb_free(&s->q);
   pb_free(&s->alt);
-  free(s->ev_trail); free(s->ev_death); free(s->ev_split); free(s->ev_hit); free(s->dead);
+  free(s->ev_trail); free(s->ev_death); free(s->ev_split); free(s->ev_hit); free(s->dead); free(s->ev_n);
   free(s->cnt); free(s->off); free(s->dep_pos); free(s->dep_amt);
   for (int i = 0; i < MAXSDF; i++) free(s->sdf[i].d);
   for (int i = 0; i < MAXSHAPE; i++) free(s->shape[i].p);
@@ -2465,6 +2466,7 @@ static void scratch_reserve(NvSys *s, int n) {
   s->ev_death = (uint16_t *)realloc(s->ev_death, sizeof(uint16_t) * c);
   s->ev_split = (uint8_t *)realloc(s->ev_split, c);
   s->ev_hit = (uint8_t *)realloc(s->ev_hit, c);
+  s->ev_n = (float *)realloc(s->ev_n, sizeof(float) * 3 * c);
   s->dead = (uint8_t *)realloc(s->dead, c);
   s->cnt = (uint32_t *)realloc(s->cnt, sizeof(uint32_t) * c);
   s->off = (uint32_t *)realloc(s->off, sizeof(uint32_t) * (c + 1));
@@ -2691,7 +2693,8 @@ API void nv_sys_step(NvSys *s, float dt) {
     const int liq = K[KP_liquid] > 0.5f && s->fluid && s->fluid->fp[FP_liquid] > 0.5f;
     int hit = 0, cm = (int)K[KP_collide];
     /* gen bit 7 marks a particle that stuck (collide = Stick): it stays where it landed */
-    if (P->gen[i] & 128) { P->vx[i] = P->vy[i] = P->vz[i] = 0.f; }
+    /* a stuck particle keeps the surface normal (x 1 mm/s) in its velocity: shapes aligned to the motion then
+     * lie flat on whatever it stuck to, floor or wall */
     if (!liq && !(P->gen[i] & 128)) { /* liquid particles are moved by the liquid solver (nv_liquid_substep) */
     float gs = K[KP_gravity];
     float ax = G[0] * gs, ay = G[1] * gs, az = G[2] * gs;
@@ -2823,10 +2826,13 @@ API void nv_sys_step(NvSys *s, float dt) {
         const float *cv = s->col[c].vel;
         float rx = vx - cv[0], ry = vy - cv[1], rz = vz - cv[2];
         float vn = rx * nn[0] + ry * nn[1] + rz * nn[2];
-        if (vn < -0.5f) hit = 1; /* a real impact, not a particle resting on the surface */
+        if (vn < -0.5f) { /* a real impact, not a particle resting on the surface */
+          hit = 1;
+          s->ev_n[3 * i] = nn[0]; s->ev_n[3 * i + 1] = nn[1]; s->ev_n[3 * i + 2] = nn[2];
+        }
         if (cm == 3) { /* stick: it stays here from now on */
           P->gen[i] |= 128;
-          vx = cv[0]; vy = cv[1]; vz = cv[2];
+          vx = nn[0] * 1e-3f; vy = nn[1] * 1e-3f; vz = nn[2] * 1e-3f;
           break;
         }
         if (vn < 0.f) {
@@ -2953,7 +2959,13 @@ API void nv_sys_step(NvSys *s, float dt) {
         if (r[0] * pv[0] + r[1] * pv[1] + r[2] * pv[2] < 0.f) { r[0] = -r[0]; r[1] = -r[1]; r[2] = -r[2]; }
         float spd = K[KP_hit_speed] * (0.4f + 0.6f * u01(pcg(h + 5)));
         for (int k = 0; k < 3; k++) cv[k] = pv[k] * 0.5f + r[k] * spd;
-        init_particle(s, &s->q, (int)o, (int)K[KP_hit_kind], pos, cv, rgb, gen, id0 + o);
+        int hk = (int)K[KP_hit_kind];
+        init_particle(s, &s->q, (int)o, hk, pos, cv, rgb, gen, id0 + o);
+        if ((int)s->kp[hk][KP_collide] == 3) { /* a Stick type is born stuck to the surface that was hit (a stain) */
+          const float *nn = s->ev_n + 3 * (size_t)i;
+          s->q.vx[o] = nn[0] * 1e-3f; s->q.vy[o] = nn[1] * 1e-3f; s->q.vz[o] = nn[2] * 1e-3f;
+          s->q.gen[o] |= 128;
+        }
       }
       for (int j = 0; j < ns && o < (uint32_t)nq; j++, o++) {
         uint32_t h = h3(pid, step * 4099u + j, sd ^ 0xC3u);
@@ -3497,6 +3509,89 @@ static void lq_substep(NvSys *s, NvFluid *f, float h) {
   omp_set_num_threads(all);
 }
 
+/* Whitewater (after Ihmsen et al. 2012, "Unified spray, foam and air bubbles for particle-based fluids",
+ * simplified): fast liquid at the surface throws spray, fast liquid below it traps bubbles, each with a
+ * probability that grows with speed above the type's threshold. And the contact rules of the other types:
+ * liq_contact 1 = die on touching liquid (spray falling back: its death event can leave foam), 2 = ride it
+ * (foam moves with the flow); air_contact 1 = die in the air (a bubble pops at the surface). */
+static void lq_whitewater(NvSys *s, NvFluid *f, float h) {
+  PB *P = &s->p;
+  const int nx = f->nx, ny = f->ny, nz = f->nz;
+  const float inv = 1.f / f->dx;
+  const uint32_t sd = (uint32_t)s->sp[SP_seed] * 2654435761u, step = s->stepno;
+  int any_contact = 0, any_ww = 0;
+  for (int k = 0; k < s->nk; k++) {
+    any_contact |= s->kp[k][KP_liq_contact] > 0.f || s->kp[k][KP_air_contact] > 0.f;
+    any_ww |= s->kp[k][KP_liquid] > 0.5f && ((s->kp[k][KP_spray_kind] >= 0.f && s->kp[k][KP_spray_rate] > 0.f) ||
+                                             (s->kp[k][KP_bubble_kind] >= 0.f && s->kp[k][KP_bubble_rate] > 0.f));
+  }
+  /* contact rules */
+  if (any_contact) {
+    const float g[3] = {s->sp[SP_gx], s->sp[SP_gy], s->sp[SP_gz]};
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < P->n; i++) {
+      const float *K = s->kp[P->kind[i]];
+      int lc = (int)K[KP_liq_contact], ac = (int)K[KP_air_contact];
+      if ((!lc && !ac) || K[KP_liquid] > 0.5f) continue;
+      float x = (P->x[i] - f->o[0]) * inv, y = (P->y[i] - f->o[1]) * inv, z = (P->z[i] - f->o[2]) * inv;
+      int ci = (int)x, cj = (int)y, ck = (int)z;
+      if (x < 0.f || y < 0.f || z < 0.f || ci >= nx || cj >= ny || ck >= nz) continue;
+      int type = f->ctype[CI(f, ci, cj, ck)];
+      if (type == 0 && lc == 1) P->age[i] = P->life[i];
+      else if (type == 0 && lc == 2) { /* ride the flow; cancel the gravity the particle step will add */
+        for (int q = 0; q < 3; q++) {
+          float v = face_samp(f, q == 0 ? f->u : (q == 1 ? f->v : f->w), q, x, y, z) - g[q] * K[KP_gravity] * h;
+          if (q == 0) P->vx[i] = v; else if (q == 1) P->vy[i] = v; else P->vz[i] = v;
+        }
+      } else if (type == 2 && ac == 1) P->age[i] = P->life[i];
+    }
+  }
+  if (!any_ww) return;
+  /* spawn: decided in parallel (a deterministic hash per particle and step), appended in order */
+  int m = 0;
+  for (int i = 0; i < P->n; i++)
+    if (s->kp[P->kind[i]][KP_liquid] > 0.5f) m++;
+  if (!m) return;
+  uint8_t *what = (uint8_t *)malloc((size_t)P->n);
+  if (!what) return;
+#pragma omp parallel for schedule(static)
+  for (int i = 0; i < P->n; i++) {
+    what[i] = 0;
+    const float *K = s->kp[P->kind[i]];
+    if (K[KP_liquid] <= 0.5f) continue;
+    float sp = sqrtf(P->vx[i] * P->vx[i] + P->vy[i] * P->vy[i] + P->vz[i] * P->vz[i]);
+    float th = K[KP_ww_speed] > 1e-3f ? K[KP_ww_speed] : 1e-3f;
+    float pot = clampf((sp - th) / th, 0.f, 1.f);
+    if (pot <= 0.f) continue;
+    int ci = (int)((P->x[i] - f->o[0]) * inv), cj = (int)((P->y[i] - f->o[1]) * inv),
+        ck = (int)((P->z[i] - f->o[2]) * inv);
+    if (ci < 1 || cj < 1 || ck < 1 || ci >= nx - 1 || cj >= ny - 1 || ck >= nz - 1) continue;
+    size_t c = CI(f, ci, cj, ck);
+    int surface = f->ctype[c - 1] == 2 || f->ctype[c + 1] == 2 || f->ctype[c - nx] == 2 || f->ctype[c + nx] == 2 ||
+                  f->ctype[c - (size_t)nx * ny] == 2 || f->ctype[c + (size_t)nx * ny] == 2;
+    float rate = surface ? K[KP_spray_rate] : K[KP_bubble_rate];
+    float kind = surface ? K[KP_spray_kind] : K[KP_bubble_kind];
+    if (kind < 0.f || rate <= 0.f) continue;
+    if (u01(h3(P->id[i], step, sd ^ 0x5ED5u)) < 1.f - expf(-rate * pot * h)) what[i] = surface ? 1 : 2;
+  }
+  for (int i = 0, base = P->n; i < base; i++) {
+    if (!what[i]) continue;
+    const float *K = s->kp[P->kind[i]];
+    int kind = (int)(what[i] == 1 ? K[KP_spray_kind] : K[KP_bubble_kind]);
+    if (kind < 0 || kind >= s->nk || P->n >= (int)s->sp[SP_max_particles]) continue;
+    float r[3], pos[3] = {P->x[i], P->y[i], P->z[i]}, vel[3];
+    rand_dir(h3(P->id[i], step, sd ^ 0x5ED6u), r);
+    float keep = what[i] == 1 ? 1.f : 0.3f, jit = what[i] == 1 ? 0.25f : 0.05f;
+    vel[0] = P->vx[i] * keep + r[0] * jit;
+    vel[1] = P->vy[i] * keep + r[1] * jit;
+    vel[2] = P->vz[i] * keep + r[2] * jit;
+    pb_reserve(P, P->n + 1);
+    init_particle(s, P, P->n, kind, pos, vel, NULL, 1, s->next_id++);
+    P->n++;
+  }
+  free(what);
+}
+
 static void lq_substep_(NvSys *s, NvFluid *f, float h) {
   PB *P = &s->p;
   const int n = P->n;
@@ -3748,6 +3843,7 @@ static void lq_substep_(NvSys *s, NvFluid *f, float h) {
     if (px < lo[0] || py < lo[1] || pz < lo[2] || px >= hi[0] || py >= hi[1] || pz >= hi[2]) P->age[i] = P->life[i] + 1.f;
   }
   f->maxvel = vmax;
+  lq_whitewater(s, f, h);
 }
 
 API int nv_liquid_count(NvSys *s) {

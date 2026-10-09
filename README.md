@@ -62,6 +62,9 @@ make -C core
 | Wisps | Will-o'-wisps wander through the dark, drawing trails and shedding motes |
 | Arcane Orb | Light orbits a floating orb while arcs of lightning crackle out from it |
 | Spirit Smoke | Glowing mist that shines cyan where it is fresh and fades to violet |
+| Blood Splatter | Drops break up in flight and stain the wall and floor, each stain flat on what it hit |
+| Ink in Water | Ink sinks through still water in curling, billowing tendrils |
+| Whitewater | A wall of water crashes over a block: spray, foam riding the surface, bubbles |
 | Burn Away | An object disintegrates along a ragged glowing front, shedding embers and ash |
 | Lightning | Cloud-to-ground strike grown by the dielectric breakdown model: stepped leader, return strokes, cooling afterglow, impact spatter. With *Camera, World & Glow*, a cloud deck the flash lights from inside |
 | Empty System | Starting point |
@@ -247,6 +250,20 @@ music triggers and events.
   Bake skips the surface and it is meshed for display. Blender 5.2 crashes meshing zero points, so the
   tree only meshes when there are some.
 - **Example:** [`examples/splash_tank.py`](examples/splash_tank.py).
+
+### Liquid effects: splatter, ink, whitewater
+- **Stains:** a particle that sticks keeps its surface's normal (×1 mm/s) in its velocity, so a shape aligned to
+  the motion lies flat on whatever it stuck to, floor or wall. A hit child of a *Stick* type is born stuck to
+  the surface that was hit, facing out from it.
+- **Whitewater** (after Ihmsen et al. 2012, *Unified spray, foam and air bubbles*, simplified): liquid types get
+  *Spray* and *Bubble* types and rates.
+  - Fast liquid at the surface throws spray; fast liquid below it traps bubbles. The chance grows with the speed
+    above *threshold*, and spawns are decided per particle with a hash, so runs repeat.
+  - Other types get contact rules: *On Liquid* Dies (spray landing back: its death burst leaves foam) or Rides
+    (foam moves with the flow, gravity cancelled); *In Air* Dies (a bubble pops at the surface).
+  - Whitewater renders from a companion object that draws a liquid system's non-liquid points, while the
+    liquid itself renders as its surface.
+- **Ink** gas look: the smoke absorbs in *Ink Color* and nothing glows.
 
 ### Weather: shapes for every particle
 - **Shapes display:** every particle type can be drawn as a mesh of its own, instanced on its particles by
@@ -503,6 +520,7 @@ Same plume, empty domain grown from 64³ to 256³ (old → now):
 python3 tests/test_core.py                                     # core: correctness + speed, ~7 s
 blender -b --factory-startup --python tests/blender_presets.py -- --frames 24
 blender -b --factory-startup --python tests/blender_lightning.py   # bolt controls, target, timeline
+blender -b --factory-startup --python tests/blender_fx.py         # stains flat on wall and floor, whitewater, ink
 blender -b --factory-startup --python tests/blender_weather.py    # shapes per type, landed leaves still, globe, rain chain
 blender -b --factory-startup --python tests/blender_magic.py      # ribbons follow real paths, tangent sparks, spirit look
 blender -b --factory-startup --python tests/blender_viscous.py    # nozzle, thin honey stream, looks, melting under a lamp
@@ -517,8 +535,8 @@ blender -b --factory-startup --python tests/blender_render.py -- FIREWORKS 260 o
 
 ## Researched, not built (yet)
 
-Liquids still to come: whitewater (spray, foam, bubbles), surface tension and elasticity (slime is only
-viscous), APIC transfers, a multigrid preconditioner for the viscosity solve, and the liquid solver on the GPU.
+Liquids still to come: surface tension and elasticity (slime is only viscous), two-way whitewater (bubbles
+do not push the liquid), APIC transfers, a multigrid preconditioner for the viscosity solve, and the liquid solver on the GPU.
 
 From the paid tools (X-Particles, tyFlow, EmberGen, Pro Pyro, VFX Pro Simulations):
 - APIC liquids (FLIP/PIC is built), granular, cloth

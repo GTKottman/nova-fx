@@ -300,6 +300,26 @@ def ripple_mesh(name="Nova Ripple"):
     return me
 
 
+def splat_mesh(name="Nova Splat", seed=3):
+    """A flat stain with a ragged, spiky rim (blood drops leave these), radius about 1, normal along Z."""
+    import random
+    rng = random.Random(seed)
+    me = bpy.data.meshes.new(name)
+    bm = bmesh.new()
+    rim = []
+    n = 40
+    for i in range(n):
+        a = 2 * math.pi * i / n
+        r = 0.75 + 0.2 * rng.random() + (0.45 * rng.random() if rng.random() < 0.18 else 0.0)
+        rim.append(bm.verts.new((r * math.cos(a), r * math.sin(a), 0.002)))
+    c = bm.verts.new((0, 0, 0.004))
+    for i in range(n):
+        bm.faces.new((c, rim[i], rim[(i + 1) % n]))
+    bm.to_mesh(me)
+    bm.free()
+    return me
+
+
 def pellet_mesh(name="Nova Pellet"):
     me = bpy.data.meshes.new(name)
     bm = bmesh.new()

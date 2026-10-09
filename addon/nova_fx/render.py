@@ -70,6 +70,8 @@ def volume_material(sysob):
     mat["look"] = look
     if look == "SPIRIT":
         return _spirit_material(mat)
+    if look == "INK":
+        return _ink_material(mat)
     if not mat.node_tree:
         mat.use_nodes = True
     nt = mat.node_tree
@@ -109,6 +111,24 @@ def volume_material(sysob):
     vol.inputs["Density Attribute"].default_value = "density"
     vol.inputs["Temperature Attribute"].default_value = ""
     vol.inputs["Blackbody Intensity"].default_value = 0.0
+    return mat
+
+
+def _ink_material(mat):
+    """Dye: absorbs and scatters a little, nothing glows."""
+    if not mat.node_tree:
+        mat.use_nodes = True
+    nt = mat.node_tree
+    nt.nodes.clear()
+    out = _node(nt, "ShaderNodeOutputMaterial", (600, 0))
+    vol = _node(nt, "ShaderNodeVolumePrincipled", (300, 0))
+    vol.name = "nova_volume"
+    nt.links.new(vol.outputs[0], out.inputs["Volume"])
+    vol.inputs["Density Attribute"].default_value = "density"
+    vol.inputs["Temperature Attribute"].default_value = ""
+    vol.inputs["Blackbody Intensity"].default_value = 0.0
+    vol.inputs["Emission Strength"].default_value = 0.0
+    mat["ink"] = True
     return mat
 
 
@@ -317,6 +337,9 @@ def sync_materials(sysob):
         if v:
             v.inputs["Density"].default_value = fl.density_mult
             v.inputs["Color"].default_value = (*fl.smoke_color, 1.0)
+        if vmat.get("ink") and v:  # ink: absorbs its colour (Smoke Density sets how strong)
+            v.inputs["Color"].default_value = (*fl.ink_color, 1.0)
+            v.inputs["Absorption Color"].default_value = (*fl.ink_color, 1.0)
         sp = nt.nodes.get("nova_spirit")
         if sp:  # spirit: Color when fresh (hot), End Color as it fades; glow from Flame Brightness; thin
             sp.inputs["A"].default_value = (*fl.spirit_color2, 1)
@@ -595,7 +618,52 @@ def sync_liquid(sysob):
         sob.data.materials[0] = mat  # follow the Look unless the user put their own material on
     _mod_input(mod, "Material", sob.data.materials[0])
     sob.matrix_world = sysob.matrix_world.copy()
-    # the water is the surface: the points stay for the viewport, out of the render
+    # the water is the surface: the points stay for the viewport, out of the render. Other types in the system
+    # (whitewater) render from a companion object that draws only them
     sysob.hide_render = True
+    _whitewater_object(sysob, any(not k.liquid for k in n.kinds))
     sob.update_tag()
     return sob
+
+
+def _whitewater_object(sysob, show):
+    name = sysob.name + " Whitewater"
+    ob = bpy.data.objects.get(name)
+    if ob is None:
+        if not show:
+            return None
+        ob = bpy.data.objects.new(name, bpy.data.pointclouds.new(name))
+        for coll in sysob.users_collection:
+            coll.objects.link(ob)
+        ob.hide_select = True
+    ob.hide_render = ob.hide_viewport = not show
+    mod = ob.modifiers.get("Nova Whitewater") or ob.modifiers.new("Nova Whitewater", "NODES")
+    mod.node_group = _not_liquid_tree()
+    _mod_input(mod, "System", sysob)
+    if not ob.data.materials and sysob.data.materials:
+        ob.data.materials.append(sysob.data.materials[0])
+    ob.matrix_world = sysob.matrix_world.copy()
+    return ob
+
+
+def _not_liquid_tree():
+    tree = bpy.data.node_groups.get("Nova Not Liquid")
+    if tree is not None:
+        return tree
+    tree = bpy.data.node_groups.new("Nova Not Liquid", "GeometryNodeTree")
+    tree.interface.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+    tree.interface.new_socket("System", in_out="INPUT", socket_type="NodeSocketObject")
+    tree.interface.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+    gi, go = tree.nodes.new("NodeGroupInput"), tree.nodes.new("NodeGroupOutput")
+    info = tree.nodes.new("GeometryNodeObjectInfo")
+    info.transform_space = "RELATIVE"
+    tree.links.new(gi.outputs["System"], info.inputs["Object"])
+    attr = tree.nodes.new("GeometryNodeInputNamedAttribute")
+    attr.data_type = "BOOLEAN"
+    attr.inputs["Name"].default_value = "nova_liquid"
+    dele = tree.nodes.new("GeometryNodeDeleteGeometry")
+    dele.domain = "POINT"
+    tree.links.new(info.outputs["Geometry"], dele.inputs["Geometry"])
+    tree.links.new(attr.outputs["Attribute"], dele.inputs["Selection"])
+    tree.links.new(dele.outputs[0], go.inputs[0])
+    return tree
