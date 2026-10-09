@@ -121,12 +121,22 @@ def s_dissolve():
     L("disintegrate added")
 def s_dissolve_shot():
     shot("6_dissolve")
+def s_liquid():
+    w, a = area3d()
+    with bpy.context.temp_override(window=w, area=a):
+        bpy.ops.nova.add_preset(preset="LIQUID")
+    for f in range(1, 12):
+        bpy.context.scene.frame_set(f)
+    select(bpy.data.objects["Splash Tank"])
+    L("liquid added", bpy.data.objects["Splash Tank"].nova.fluid.mode)
+def s_liquid_shot():
+    shot("7_liquid")
 def s_quit():
     L("done")
     log.close()
     bpy.ops.wm.quit_blender()
 
-seq = [setup, s_system, s_emitter, s_emitter_shot, s_fireworks, s_fw_shot, s_music, s_music_shot, s_formation, s_formation_shot, s_dissolve, s_dissolve_shot, s_quit]
+seq = [setup, s_system, s_emitter, s_emitter_shot, s_fireworks, s_fw_shot, s_music, s_music_shot, s_formation, s_formation_shot, s_dissolve, s_dissolve_shot, s_liquid, s_liquid_shot, s_quit]
 def tick():
     if not seq:
         return None

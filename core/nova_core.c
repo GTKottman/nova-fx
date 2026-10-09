@@ -2668,6 +2668,9 @@ API void nv_sys_step(NvSys *s, float dt) {
     const float *K = s->kp[P->kind[i]];
     float x = P->x[i], y = P->y[i], z = P->z[i], vx = P->vx[i], vy = P->vy[i], vz = P->vz[i];
     const uint32_t id = P->id[i];
+    const int liq = K[KP_liquid] > 0.5f && s->fluid && s->fluid->fp[FP_liquid] > 0.5f;
+    int hit = 0, cm = (int)K[KP_collide];
+    if (!liq) { /* liquid particles are moved by the liquid solver (nv_liquid_substep) */
     float gs = K[KP_gravity];
     float ax = G[0] * gs, ay = G[1] * gs, az = G[2] * gs;
     az += K[KP_buoyancy] * (P->temp[i] - Ta) * 0.001f;
@@ -2760,7 +2763,6 @@ API void nv_sys_step(NvSys *s, float dt) {
     x += vx * dt; y += vy * dt; z += vz * dt;
 
     /* collisions */
-    int hit = 0, cm = (int)K[KP_collide];
     if (cm > 0 && s->ncol) {
       /* continuous detection: sphere-trace the step against every collider's distance function,
        * so fast particles cannot tunnel through thin geometry between substeps */
@@ -2812,6 +2814,7 @@ API void nv_sys_step(NvSys *s, float dt) {
     }
     P->x[i] = x; P->y[i] = y; P->z[i] = z;
     P->vx[i] = vx; P->vy[i] = vy; P->vz[i] = vz;
+    }
 
     /* temperature: Newton + radiative cooling toward ambient */
     float T = P->temp[i];
@@ -3005,16 +3008,297 @@ API void nv_sys_step(NvSys *s, float dt) {
   s->time += dt;
 }
 
+/* ========================================================================= liquids
+ * FLIP/PIC on the fluid grid in liquid mode. The liquid is made of the system's particles whose type has
+ * `liquid` on, so emitters, colliders, music and events all work with it. Per substep:
+ *   1. bucket the liquid particles by cell (counting sort: deterministic for any thread count)
+ *   2. particle -> grid: trilinear splat of velocity onto the MAC faces, in 27 colour passes so threads
+ *      never write the same face
+ *   3. cell types: liquid (holds particles), solid (colliders and walls), air (pressure 0)
+ *   4. gravity, then the pressure projection of the gas solver (MGPCG) with air as Dirichlet cells
+ *   5. extrapolate the new velocity a few faces into the air
+ *   6. grid -> particle: v = flip * (v_p + grid change) + (1 - flip) * grid velocity
+ *   7. move through the grid velocity (midpoint), push out of colliders and walls */
+typedef struct {
+  int *idx, *cell, *order, *start;
+  int cap, ccap;
+} LiqBuf;
+static LiqBuf g_lq; /* scratch, grown as needed (one liquid solve runs at a time) */
+
+static void lq_reserve(int n, size_t nc) {
+  if (n > g_lq.cap) {
+    g_lq.cap = n + n / 2 + 1024;
+    g_lq.idx = (int *)realloc(g_lq.idx, sizeof(int) * g_lq.cap);
+    g_lq.cell = (int *)realloc(g_lq.cell, sizeof(int) * g_lq.cap);
+    g_lq.order = (int *)realloc(g_lq.order, sizeof(int) * g_lq.cap);
+  }
+  if ((int)nc + 1 > g_lq.ccap) {
+    g_lq.ccap = (int)nc + 1;
+    g_lq.start = (int *)realloc(g_lq.start, sizeof(int) * g_lq.ccap);
+  }
+}
+
+static inline float face_samp(const NvFluid *f, const float *A, int comp, float x, float y, float z) {
+  /* x, y, z in cell units (cell centres at i + 0.5) */
+  if (comp == 0) return samp(A, f->nx + 1, f->ny, f->nz, x, y - 0.5f, z - 0.5f, 0);
+  if (comp == 1) return samp(A, f->nx, f->ny + 1, f->nz, x - 0.5f, y, z - 0.5f, 0);
+  return samp(A, f->nx, f->ny, f->nz + 1, x - 0.5f, y - 0.5f, z, 0);
+}
+
+static void lq_walls(NvFluid *f) {
+  int walls = (int)f->fp[FP_walls]; /* 0 open, 1 floor and sides, 2 closed box */
+  if (walls <= 0) return;
+  const int big = f->nc > 65536;
+#pragma omp parallel for schedule(static) if (big)
+  for (int k = 0; k < f->nz; k++)
+    for (int j = 0; j < f->ny; j++)
+      for (int i = 0; i < f->nx; i++) {
+        int edge = i == 0 || j == 0 || k == 0 || i == f->nx - 1 || j == f->ny - 1 || (walls >= 2 && k == f->nz - 1);
+        if (edge) f->solid[CI(f, i, j, k)] = 1;
+      }
+}
+
+/* extrapolate one face component from valid faces (mask) into `layers` rings of invalid ones */
+static void lq_extrapolate(float *A, uint8_t *valid, uint8_t *tmpm, int sx, int sy, int sz, int layers) {
+  size_t n = (size_t)sx * sy * sz;
+  const int big = n > 65536;
+  for (int l = 0; l < layers; l++) {
+    memcpy(tmpm, valid, n);
+#pragma omp parallel for schedule(static) if (big)
+    for (int k = 0; k < sz; k++)
+      for (int j = 0; j < sy; j++)
+        for (int i = 0; i < sx; i++) {
+          size_t c = (size_t)i + (size_t)sx * ((size_t)j + (size_t)sy * k);
+          if (valid[c]) continue;
+          float sum = 0.f;
+          int cnt = 0;
+          const int di[6] = {-1, 1, 0, 0, 0, 0}, dj[6] = {0, 0, -1, 1, 0, 0}, dk[6] = {0, 0, 0, 0, -1, 1};
+          for (int q = 0; q < 6; q++) {
+            int ii = i + di[q], jj = j + dj[q], kk = k + dk[q];
+            if (ii < 0 || jj < 0 || kk < 0 || ii >= sx || jj >= sy || kk >= sz) continue;
+            size_t d = (size_t)ii + (size_t)sx * ((size_t)jj + (size_t)sy * kk);
+            if (valid[d]) { sum += A[d]; cnt++; }
+          }
+          if (cnt) { A[c] = sum / cnt; tmpm[c] = 1; }
+        }
+    memcpy(valid, tmpm, n);
+  }
+}
+
+static void lq_substep_(NvSys *s, NvFluid *f, float h);
+/* Threads sized to the work: a small liquid on all cores spends its time at barriers, and when the machine
+ * is busy (Blender's own threads, other programs) a preempted thread stalls every barrier: seen, 60 ms
+ * frames taking seconds with 16 threads, steady with 6. */
+static void lq_substep(NvSys *s, NvFluid *f, float h) {
+  int all = omp_get_max_threads();
+  int want = 2 + s->p.n / 20000 + (int)(f->nc / 65536);
+  omp_set_num_threads(want < all ? want : all);
+  lq_substep_(s, f, h);
+  omp_set_num_threads(all);
+}
+
+static void lq_substep_(NvSys *s, NvFluid *f, float h) {
+  PB *P = &s->p;
+  const int n = P->n;
+  const int nx = f->nx, ny = f->ny, nz = f->nz;
+  const float inv = 1.f / f->dx;
+  /* small liquids: threads cost more than they save (and stall badly when the machine is busy) */
+  const int big = f->nc > 65536;
+  lq_reserve(n, f->nc);
+  /* 1. liquid particles and their cells */
+  int m = 0;
+  for (int i = 0; i < n; i++)
+    if (s->kp[P->kind[i]][KP_liquid] > 0.5f) g_lq.idx[m++] = i;
+  memset(g_lq.start, 0, sizeof(int) * (f->nc + 1));
+  for (int q = 0; q < m; q++) {
+    int i = g_lq.idx[q];
+    int ci = (int)floorf((P->x[i] - f->o[0]) * inv), cj = (int)floorf((P->y[i] - f->o[1]) * inv),
+        ck = (int)floorf((P->z[i] - f->o[2]) * inv);
+    ci = ci < 0 ? 0 : (ci >= nx ? nx - 1 : ci);
+    cj = cj < 0 ? 0 : (cj >= ny ? ny - 1 : cj);
+    ck = ck < 0 ? 0 : (ck >= nz ? nz - 1 : ck);
+    int c = (int)CI(f, ci, cj, ck);
+    g_lq.cell[q] = c;
+    g_lq.start[c + 1]++;
+  }
+  for (size_t c = 0; c < f->nc; c++) g_lq.start[c + 1] += g_lq.start[c];
+  {
+    int *fill = (int *)f->tmp[9]; /* scratch: running offsets */
+    memcpy(fill, g_lq.start, sizeof(int) * f->nc);
+    for (int q = 0; q < m; q++) g_lq.order[fill[g_lq.cell[q]]++] = g_lq.idx[q];
+  }
+  /* 2. particle -> grid (momentum in u/v/w, weights in u1/v1/w1) */
+  float *U = f->u, *V = f->v, *W = f->w, *wu = f->u1, *wv = f->v1, *ww = f->w1;
+  memset(U, 0, sizeof(float) * f->nu); memset(V, 0, sizeof(float) * f->nv); memset(W, 0, sizeof(float) * f->nw);
+  memset(wu, 0, sizeof(float) * f->nu); memset(wv, 0, sizeof(float) * f->nv); memset(ww, 0, sizeof(float) * f->nw);
+  for (int col = 0; col < 27; col++) {
+    int cx = col % 3, cy = (col / 3) % 3, cz = col / 9;
+#pragma omp parallel for schedule(dynamic, 2) if (big)
+    for (int k = cz; k < nz; k += 3)
+      for (int j = cy; j < ny; j += 3)
+        for (int i = cx; i < nx; i += 3) {
+          size_t c = CI(f, i, j, k);
+          for (int a = g_lq.start[c]; a < g_lq.start[c + 1]; a++) {
+            int p = g_lq.order[a];
+            float x = (P->x[p] - f->o[0]) * inv, y = (P->y[p] - f->o[1]) * inv, z = (P->z[p] - f->o[2]) * inv;
+            float vel[3] = {P->vx[p], P->vy[p], P->vz[p]};
+            for (int comp = 0; comp < 3; comp++) {
+              float gx = x - (comp == 0 ? 0.f : 0.5f), gy = y - (comp == 1 ? 0.f : 0.5f), gz = z - (comp == 2 ? 0.f : 0.5f);
+              int sx = nx + (comp == 0), sy = ny + (comp == 1), sz = nz + (comp == 2);
+              float *A = comp == 0 ? U : (comp == 1 ? V : W), *Wt = comp == 0 ? wu : (comp == 1 ? wv : ww);
+              int i0 = (int)floorf(gx), j0 = (int)floorf(gy), k0 = (int)floorf(gz);
+              float tx = gx - i0, ty = gy - j0, tz = gz - k0;
+              for (int d = 0; d < 8; d++) {
+                int ii = i0 + (d & 1), jj = j0 + ((d >> 1) & 1), kk = k0 + ((d >> 2) & 1);
+                if (ii < 0 || jj < 0 || kk < 0 || ii >= sx || jj >= sy || kk >= sz) continue;
+                float wgt = ((d & 1) ? tx : 1.f - tx) * (((d >> 1) & 1) ? ty : 1.f - ty) * (((d >> 2) & 1) ? tz : 1.f - tz);
+                size_t fi = (size_t)ii + (size_t)sx * ((size_t)jj + (size_t)sy * kk);
+                A[fi] += wgt * vel[comp];
+                Wt[fi] += wgt;
+              }
+            }
+          }
+        }
+  }
+  /* normalise; keep the old grid velocity for FLIP (u0) */
+#define LQ_NORM(A, Wt, A0, N)                                         \
+  _Pragma("omp parallel for schedule(static) if (big)") for (size_t q = 0; q < (N); q++) { \
+    A[q] = Wt[q] > 1e-6f ? A[q] / Wt[q] : 0.f;                        \
+    A0[q] = A[q];                                                     \
+  }
+  LQ_NORM(U, wu, f->u0, f->nu)
+  LQ_NORM(V, wv, f->v0, f->nv)
+  LQ_NORM(W, ww, f->w0, f->nw)
+#undef LQ_NORM
+  /* 3. cell types and the pressure region */
+  lq_walls(f);
+  memset(f->t_prs, 0, f->nt);
+#pragma omp parallel for schedule(static) if (big)
+  for (int k = 0; k < nz; k++)
+    for (int j = 0; j < ny; j++)
+      for (int i = 0; i < nx; i++) {
+        size_t c = CI(f, i, j, k);
+        int liquid = g_lq.start[c + 1] > g_lq.start[c];
+        f->ctype[c] = f->solid[c] ? 1 : (liquid ? 0 : 2);
+        if (f->ctype[c]) f->phi[c] = 0.f;
+      }
+  for (int k = 0; k < nz; k++) /* tiles with liquid, and their neighbours (faces on the tile border) */
+    for (int j = 0; j < ny; j++)
+      for (int i = 0; i < nx; i++) {
+        if (f->ctype[CI(f, i, j, k)] != 0) continue;
+        int tx = i / TS, ty = j / TS, tz = k / TS;
+        for (int dz = -1; dz <= 1; dz++)
+          for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++) {
+              int x = tx + dx, y = ty + dy, z = tz + dz;
+              if (x < 0 || y < 0 || z < 0 || x >= f->ntx || y >= f->nty || z >= f->ntz) continue;
+              f->t_prs[x + f->ntx * (y + f->nty * z)] = 1;
+            }
+      }
+  f->n_prs = 0;
+  for (int t = 0; t < f->nt; t++)
+    if (f->t_prs[t]) f->tl_prs[f->n_prs++] = t;
+  hierarchy_full(f);
+  active_blocks(f);
+  /* 4. gravity on faces that touch liquid, then project */
+  const float g[3] = {s->sp[SP_gx], s->sp[SP_gy], s->sp[SP_gz]};
+#pragma omp parallel for schedule(static) if (big)
+  for (size_t q = 0; q < f->nu; q++) if (wu[q] > 1e-6f) U[q] += g[0] * h;
+#pragma omp parallel for schedule(static) if (big)
+  for (size_t q = 0; q < f->nv; q++) if (wv[q] > 1e-6f) V[q] += g[1] * h;
+#pragma omp parallel for schedule(static) if (big)
+  for (size_t q = 0; q < f->nw; q++) if (ww[q] > 1e-6f) W[q] += g[2] * h;
+  if (f->n_prs) project_(f, U, V, W);
+  /* 5. faces next to liquid are valid; spread into the air. FLIP change only where we had samples */
+  uint8_t *vm = (uint8_t *)f->tmp[7], *tm = (uint8_t *)f->tmp[8];
+  for (int comp = 0; comp < 3; comp++) {
+    int sx = nx + (comp == 0), sy = ny + (comp == 1), sz = nz + (comp == 2);
+    float *A = comp == 0 ? U : (comp == 1 ? V : W), *A0 = comp == 0 ? f->u0 : (comp == 1 ? f->v0 : f->w0);
+    const float *Wt = comp == 0 ? wu : (comp == 1 ? wv : ww);
+#pragma omp parallel for schedule(static) if (big)
+    for (int k = 0; k < sz; k++)
+      for (int j = 0; j < sy; j++)
+        for (int i = 0; i < sx; i++) {
+          size_t fi = (size_t)i + (size_t)sx * ((size_t)j + (size_t)sy * k);
+          int a0 = i - (comp == 0), b0 = j - (comp == 1), c0 = k - (comp == 2); /* the two cells */
+          int liq = 0;
+          if (a0 >= 0 && b0 >= 0 && c0 >= 0 && f->ctype[CI(f, a0, b0, c0)] == 0) liq = 1;
+          if (i < nx && j < ny && k < nz && f->ctype[CI(f, i, j, k)] == 0) liq = 1;
+          vm[fi] = (uint8_t)liq;
+          A0[fi] = Wt[fi] > 1e-6f ? A[fi] - A0[fi] : 0.f; /* u0 now holds the change */
+        }
+    lq_extrapolate(A, vm, tm, sx, sy, sz, 3);
+  }
+  /* 6 + 7. grid -> particle, move, collide */
+  const float flip = clampf(f->fp[FP_flip], 0.f, 1.f);
+  const float lo[3] = {f->o[0], f->o[1], f->o[2]};
+  const float hi[3] = {f->o[0] + nx * f->dx, f->o[1] + ny * f->dx, f->o[2] + nz * f->dx};
+  const int walls = (int)f->fp[FP_walls];
+  float vmax = 0.f;
+#pragma omp parallel for schedule(static) reduction(max : vmax) if (big)
+  for (int q = 0; q < m; q++) {
+    int i = g_lq.idx[q];
+    float x = (P->x[i] - lo[0]) * inv, y = (P->y[i] - lo[1]) * inv, z = (P->z[i] - lo[2]) * inv;
+    float vg[3], dv[3];
+    for (int comp = 0; comp < 3; comp++) {
+      vg[comp] = face_samp(f, comp == 0 ? U : (comp == 1 ? V : W), comp, x, y, z);
+      dv[comp] = face_samp(f, comp == 0 ? f->u0 : (comp == 1 ? f->v0 : f->w0), comp, x, y, z);
+    }
+    float vx = flip * (P->vx[i] + dv[0]) + (1.f - flip) * vg[0];
+    float vy = flip * (P->vy[i] + dv[1]) + (1.f - flip) * vg[1];
+    float vz = flip * (P->vz[i] + dv[2]) + (1.f - flip) * vg[2];
+    /* midpoint through the divergence-free grid velocity */
+    float mx = x + 0.5f * h * vg[0] * inv, my = y + 0.5f * h * vg[1] * inv, mz = z + 0.5f * h * vg[2] * inv;
+    float vm3[3];
+    for (int comp = 0; comp < 3; comp++) vm3[comp] = face_samp(f, comp == 0 ? U : (comp == 1 ? V : W), comp, mx, my, mz);
+    float px = P->x[i] + h * vm3[0], py = P->y[i] + h * vm3[1], pz = P->z[i] + h * vm3[2];
+    /* colliders: push out, remove the velocity into the surface (no bounce: liquids do not bounce) */
+    for (int c = 0; c < s->ncol; c++) {
+      float pp[3] = {px, py, pz}, op[3], nn[3];
+      if (!collider_test(s, &s->col[c], pp, op, nn)) continue;
+      px = op[0] + nn[0] * 1e-3f * f->dx; py = op[1] + nn[1] * 1e-3f * f->dx; pz = op[2] + nn[2] * 1e-3f * f->dx;
+      const float *cv = s->col[c].vel;
+      float rx = vx - cv[0], ry = vy - cv[1], rz = vz - cv[2], vn = rx * nn[0] + ry * nn[1] + rz * nn[2];
+      if (vn < 0.f) { vx -= vn * nn[0]; vy -= vn * nn[1]; vz -= vn * nn[2]; }
+    }
+    /* walls: stay inside the liquid region (one cell in from a closed side) */
+    if (walls > 0) {
+      float m0 = f->dx * 1.001f;
+      float bx0 = lo[0] + m0, bx1 = hi[0] - m0, by0 = lo[1] + m0, by1 = hi[1] - m0, bz0 = lo[2] + m0;
+      if (px < bx0) { px = bx0; if (vx < 0.f) vx = 0.f; }
+      if (px > bx1) { px = bx1; if (vx > 0.f) vx = 0.f; }
+      if (py < by0) { py = by0; if (vy < 0.f) vy = 0.f; }
+      if (py > by1) { py = by1; if (vy > 0.f) vy = 0.f; }
+      if (pz < bz0) { pz = bz0; if (vz < 0.f) vz = 0.f; }
+      if (walls >= 2 && pz > hi[2] - m0) { pz = hi[2] - m0; if (vz > 0.f) vz = 0.f; }
+    }
+    P->x[i] = px; P->y[i] = py; P->z[i] = pz;
+    P->vx[i] = vx; P->vy[i] = vy; P->vz[i] = vz;
+    float sp = fmaxf(fabsf(vx), fmaxf(fabsf(vy), fabsf(vz)));
+    vmax = sp > vmax ? sp : vmax;
+    /* out of the domain (open sides): gone */
+    if (px < lo[0] || py < lo[1] || pz < lo[2] || px >= hi[0] || py >= hi[1] || pz >= hi[2]) P->age[i] = P->life[i] + 1.f;
+  }
+  f->maxvel = vmax;
+}
+
+API int nv_liquid_count(NvSys *s) {
+  int m = 0;
+  for (int i = 0; i < s->p.n; i++) m += s->kp[s->p.kind[i]][KP_liquid] > 0.5f;
+  return m;
+}
+
 /* One frame: interleaves fluid and particle substeps. */
 API void nv_frame(NvSys *s, NvFluid *f, float dt, int psub) {
   ftz();
   double t0 = now_ms();
   if (psub < 1) psub = 1;
   int fsub = 0;
+  const int liquid = f && s && f->fp[FP_liquid] > 0.5f;
   if (f) {
     if (s && s->fluid != f) nv_sys_set_fluid(s, f);
     if (s) voxelize_pending(s);
-    f->maxvel = max_speed(f);
+    if (!liquid) f->maxvel = max_speed(f); /* liquid: the particles' top speed from the last substep */
     fsub = (int)ceilf(f->maxvel * dt / (f->fp[FP_cfl] * f->dx));
     fsub = fsub < 1 ? 1 : (fsub > (int)f->fp[FP_max_sub] ? (int)f->fp[FP_max_sub] : fsub);
   }
@@ -3024,7 +3308,11 @@ API void nv_frame(NvSys *s, NvFluid *f, float dt, int psub) {
   for (int k = 0; s && k < s->nk; k++) couple |= s->kp[k][KP_fluid_drag] > 0.f;
   double fms = 0;
   for (int i = 0; i < n; i++) {
-    if (f && (i * fsub) / n != ((i + 1) * fsub) / n) {
+    if (liquid) {
+      double a = now_ms();
+      lq_substep(s, f, h);
+      fms += now_ms() - a;
+    } else if (f && (i * fsub) / n != ((i + 1) * fsub) / n) {
       /* fluid steps spread evenly among particle substeps */
       double a = now_ms();
       fluid_substep(f, dt / fsub);

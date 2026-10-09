@@ -43,6 +43,7 @@ make -C core
 | Energy Vortex | Vortex + attractor forces, streak display |
 | Snow | Lit flakes that settle |
 | Particle Logo | Dust assembles into a word (any text, logo or mesh) with the Form force, holds, then scatters |
+| Splash Tank | FLIP liquid: a column of water falls, wraps around a ball and sloshes in a tank |
 | Burn Away | An object disintegrates along a ragged glowing front, shedding embers and ash |
 | Lightning | Cloud-to-ground strike grown by the dielectric breakdown model: stepped leader, return strokes, cooling afterglow, impact spatter. With *Camera, World & Glow*, a cloud deck the flash lights from inside |
 | Empty System | Starting point |
@@ -203,6 +204,31 @@ Press Play to watch it live, or *Bake* to cache it to disk. The same settings ap
   (debris trails, smoky shells).
 - **Output:** OpenVDB (`density`, `heat`, `flame`, optional `velocity`) written on a background thread
   and loaded as a Blender Volume sequence with a blackbody fire material.
+
+### Liquids (FLIP)
+Set *Fire & Smoke → Mode* to **Liquid**, and mark a particle type **Liquid** (Motion). Those particles are
+the water. Every emitter shape works (the new **Volume** shape fills a closed mesh), and so do colliders,
+music triggers and events.
+- **Solver (`lq_substep` in the core):** FLIP/PIC on the same MAC grid and pressure solver as the gas.
+  - Particles are bucketed by cell with a counting sort and splatted to the faces in 27 colour passes, so
+    no two threads write the same face, with no atomics.
+  - Cells are typed liquid, solid or air. Gravity is added, then the gas solver's MGPCG projects with air
+    cells as Dirichlet (pressure 0).
+  - The new velocity is extrapolated three faces into the air. Particles take
+    `FLIP × (own + grid change) + (1 − FLIP) × grid` and move through the grid at the midpoint.
+  - Colliders push them out without bouncing. *Walls* are Open, Tank (floor and sides) or Box.
+  - Substeps follow the fastest particle (CFL).
+- **Measured:** a 0.5 m water column in a 1.6 m tank settles to 0.165 m deep, where its volume says 0.167.
+  All 8,000 particles are kept, and the same run repeats exactly. The 76k-particle Splash Tank takes
+  60–130 ms per frame.
+- **Threads:** the liquid runs on a thread count sized to its work. On a busy machine, all 16 threads on a
+  small liquid stalled at barriers (60 ms frames taking seconds); sized threads stay steady.
+- **Surface:** a companion `<system> Surface` object meshes the Liquid points in Geometry Nodes. The chain is
+  Points to SDF Grid → SDF Laplacian smoothing → an inward offset that keeps the volume → mesh, with a water
+  material. *Surface Radius* and *Smoothing* set the look. Points never reach the render; the surface does.
+  Bake skips the surface and it is meshed for display. Blender 5.2 crashes meshing zero points, so the
+  tree only meshes when there are some.
+- **Example:** [`examples/splash_tank.py`](examples/splash_tank.py).
 
 ### Upres
 *Fire & Smoke → Upres* writes the fire 2–4 times finer than it is simulated. The method is guided detail
@@ -392,6 +418,7 @@ Same plume, empty domain grown from 64³ to 256³ (old → now):
 python3 tests/test_core.py                                     # core: correctness + speed, ~7 s
 blender -b --factory-startup --python tests/blender_presets.py -- --frames 24
 blender -b --factory-startup --python tests/blender_lightning.py   # bolt controls, target, timeline
+blender -b --factory-startup --python tests/blender_liquid.py     # FLIP tank: kept, inside, around the ball, meshed
 blender -b --factory-startup --python tests/blender_upres.py      # fine VDBs: voxel size, smoke total, detail
 blender -b --factory-startup --python tests/blender_dissolve.py    # mask, material, particles and flames agree
 blender -b --factory-startup --python tests/blender_formation.py   # sampling, the logo forms, shaped shells
@@ -402,9 +429,12 @@ blender -b --factory-startup --python tests/blender_render.py -- FIREWORKS 260 o
 
 ## Researched, not built (yet)
 
+Liquids still to come: viscosity (honey, lava), whitewater (spray, foam, bubbles), surface tension, and the
+liquid solver on the GPU.
+
 From the paid tools (X-Particles, tyFlow, EmberGen, Pro Pyro, VFX Pro Simulations):
-- FLIP/APIC liquids, granular, cloth
-- An OpenVDB mesher for particles
+- APIC liquids (FLIP/PIC is built), granular, cloth
+- A particle mesher outside Geometry Nodes (the liquid surface uses Blender's SDF grid nodes)
 - ML upres
 - A domain that follows the effect around (sparse tiles cover most of that benefit)
 - Tile-ordered grid storage (memory proportional to the effect; pages are currently row-shaped)

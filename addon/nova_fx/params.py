@@ -47,6 +47,8 @@ KIND_SPEC = [
     ("wind", "F", 1.0, dict(soft_min=0, soft_max=2, group="motion", desc="How much the system wind applies")),
     ("force", "F", 1.0, dict(soft_min=0, soft_max=5, group="motion", desc="How strongly force objects act on this type")),
     ("fluid_drag", "F", 0.0, dict(min=0, soft_max=20, group="motion", desc="Ride the fluid: pull toward the fluid velocity (1/s)")),
+    ("liquid", "B", False, dict(group="motion", desc="Part of a liquid: the liquid solver moves it (Fire & Smoke in Liquid "
+                                                     "mode). Give it a long life")),
 
     ("color_mode", "E", "FIXED", dict(items=COLOR_MODES, group="color", desc="How colour is decided")),
     ("color", "C", (1.0, 0.6, 0.2), dict(group="color", desc="Colour (start colour for Gradient)")),

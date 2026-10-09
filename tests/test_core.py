@@ -319,6 +319,51 @@ def test_upres():
           f"detail {grad_fine / grad_lin:.1f}x the gradients of plain upsampling, {np.median(times):.0f} ms/frame")
 
 
+
+def _dam(threads=None, frames=96):
+    if threads:
+        core.lib().nv_set_threads(threads)
+    f = core.Fluid((32, 12, 24), 0.05, (0, 0, 0))     # 1.6 x 0.6 x 1.2 m tank
+    f.set_params(dict(liquid=1, flip=0.95, walls=1, closed_floor=1, cfl=1.0, max_sub=8))
+    s = core.System()
+    s.set_kinds([dict(liquid=1, life_min=1e6, life_max=1e6, collide=0)])
+    s.set_fluid(f)
+    # a 0.5 x 0.5 m column of water against the left wall, 8 particles per cell, jittered
+    rng = np.random.default_rng(1)
+    g = np.stack(np.meshgrid(np.arange(1, 11), np.arange(1, 11), np.arange(1, 11), indexing="ij"), -1).reshape(-1, 3)
+    pts = (np.repeat(g, 8, 0) + rng.random((len(g) * 8, 3))) * 0.05
+    s.emit(0, pts, np.zeros_like(pts))
+    for _ in range(frames):
+        s.frame(1 / 24, 1, f)
+    return s, f, len(pts)
+
+
+def test_liquid_dam_break():
+    t = time.perf_counter()
+    s, f, n0 = _dam(frames=120)
+    ms = (time.perf_counter() - t) / 120 * 1000
+    P, V, *_ = s.export()
+    assert s.count() == n0 and np.isfinite(P).all()
+    inside = (P[:, 0] > 0) & (P[:, 0] < 1.6) & (P[:, 1] > 0) & (P[:, 1] < 0.6) & (P[:, 2] > 0)
+    assert inside.all()
+    # settled: slow, and spread into a flat layer over the floor inside the walls (1.5 x 0.5 m)
+    depth_expect = 0.5 * 0.5 * 0.5 / (1.5 * 0.5)
+    top = np.percentile(P[:, 2], 99) - 0.05
+    occ = len(np.unique((P / 0.05).astype(int), axis=0))
+    speed = np.sqrt((V.astype(np.float64) ** 2).sum(1))
+    print(f"liquid dam break: {n0} particles kept, settled depth {top:.3f} m (volume says {depth_expect:.3f}), "
+          f"{occ} cells occupied vs {10 * 10 * 10} at the start, median speed {np.median(speed):.3f} m/s, "
+          f"{ms:.0f} ms/frame")
+    assert abs(top - depth_expect) < 0.06, top
+    assert 0.75 < occ / 1000 < 1.35, occ
+    assert np.median(speed) < 0.15
+    # the pressure solve sums in parallel (like the gas solver), so runs repeat exactly per thread count
+    a, _f, _n = _dam(os.cpu_count(), frames=24)
+    b, _f2, _n2 = _dam(os.cpu_count(), frames=24)
+    assert np.array_equal(a.export()[0], b.export()[0]), "the same run gave a different liquid"
+    print("liquid repeats exactly run to run")
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and (len(sys.argv) < 2 or name in sys.argv[1:]):

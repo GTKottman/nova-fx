@@ -309,3 +309,135 @@ def setup_glow(scene, strength=0.3, size=0.45, threshold=1.5):
                     pass
     scene.compositing_node_group = ng
     return ng
+
+
+# ------------------------------------------------------------------ liquid surface
+
+LIQ_TREE = "Nova Liquid Surface"
+WATER = "Nova Water"
+
+
+def liquid_tree():
+    """Points marked nova_liquid -> signed distance grid -> Laplacian smoothing -> mesh."""
+    tree = bpy.data.node_groups.get(LIQ_TREE)
+    if tree is not None and tree.get("nova_v") == 3:
+        return tree
+    if tree is None:
+        tree = bpy.data.node_groups.new(LIQ_TREE, "GeometryNodeTree")
+    tree.nodes.clear()
+    tree.interface.clear()
+    tree["nova_v"] = 3
+    for name, kind, in_out, default in (("Geometry", "NodeSocketGeometry", "INPUT", None),
+                                        ("System", "NodeSocketObject", "INPUT", None),
+                                        ("Radius", "NodeSocketFloat", "INPUT", 0.035),
+                                        ("Voxel Size", "NodeSocketFloat", "INPUT", 0.025),
+                                        ("Smoothing", "NodeSocketInt", "INPUT", 8),
+                                        ("Offset", "NodeSocketFloat", "INPUT", -0.01),
+                                        ("Material", "NodeSocketMaterial", "INPUT", None),
+                                        ("Geometry", "NodeSocketGeometry", "OUTPUT", None)):
+        s = tree.interface.new_socket(name, in_out=in_out, socket_type=kind)
+        if default is not None:
+            s.default_value = default
+    N, L = tree.nodes.new, tree.links.new
+    gi, go = N("NodeGroupInput"), N("NodeGroupOutput")
+    info = N("GeometryNodeObjectInfo")
+    info.transform_space = "RELATIVE"
+    L(gi.outputs["System"], info.inputs["Object"])
+    attr = N("GeometryNodeInputNamedAttribute")
+    attr.data_type = "BOOLEAN"
+    attr.inputs["Name"].default_value = "nova_liquid"
+    keep_out = N("FunctionNodeBooleanMath")
+    keep_out.operation = "NOT"
+    L(attr.outputs["Attribute"], keep_out.inputs[0])
+    dele = N("GeometryNodeDeleteGeometry")
+    dele.domain = "POINT"
+    L(info.outputs["Geometry"], dele.inputs["Geometry"])
+    L(keep_out.outputs[0], dele.inputs["Selection"])
+    sdf = N("GeometryNodePointsToSDFGrid")
+    L(dele.outputs[0], sdf.inputs["Points"])
+    L(gi.outputs["Radius"], sdf.inputs["Radius"])
+    L(gi.outputs["Voxel Size"], sdf.inputs["Voxel Size"])
+    smooth = N("GeometryNodeSDFGridLaplacian")
+    L(sdf.outputs[0], smooth.inputs["Grid"])
+    L(gi.outputs["Smoothing"], smooth.inputs["Iterations"])
+    shrink = N("GeometryNodeSDFGridOffset")  # big particle spheres blur well; pull back in to keep the volume
+    L(smooth.outputs[0], shrink.inputs["Grid"])
+    L(gi.outputs["Offset"], shrink.inputs["Distance"])
+    mesh = N("GeometryNodeGridToMesh")
+    L(shrink.outputs[0], mesh.inputs["Grid"])
+    shade = N("GeometryNodeSetShadeSmooth")
+    L(mesh.outputs[0], shade.inputs["Mesh"])
+    mat = N("GeometryNodeSetMaterial")
+    L(shade.outputs[0], mat.inputs["Geometry"])
+    L(gi.outputs["Material"], mat.inputs["Material"])
+    # Points to SDF Grid crashes Blender 5.2 on zero points: only mesh when there are some (Switch is lazy)
+    count = N("GeometryNodeAttributeDomainSize")
+    count.component = "POINTCLOUD"
+    L(dele.outputs[0], count.inputs[0])
+    any_ = N("FunctionNodeCompare")
+    any_.data_type, any_.operation = "INT", "GREATER_THAN"
+    L(count.outputs["Point Count"], any_.inputs["A"])
+    any_.inputs["B"].default_value = 0
+    sw = N("GeometryNodeSwitch")
+    sw.input_type = "GEOMETRY"
+    L(any_.outputs[0], sw.inputs["Switch"])
+    L(mat.outputs[0], sw.inputs["True"])
+    L(sw.outputs[0], go.inputs["Geometry"])
+    return tree
+
+
+def water_material():
+    mat = bpy.data.materials.get(WATER)
+    if mat is not None:
+        return mat
+    mat = bpy.data.materials.new(WATER)
+    mat.use_nodes = True
+    b = next(n for n in mat.node_tree.nodes if n.type == "BSDF_PRINCIPLED")
+    b.inputs["Base Color"].default_value = (0.85, 0.93, 1.0, 1)
+    b.inputs["Roughness"].default_value = 0.02
+    b.inputs["IOR"].default_value = 1.333
+    b.inputs["Transmission Weight"].default_value = 1.0
+    mat.diffuse_color = (0.3, 0.55, 0.9, 0.6)
+    return mat
+
+
+def sync_liquid(sysob):
+    """Make (or update, or hide) the meshed surface of a liquid system."""
+    n = sysob.nova
+    fl = n.fluid
+    liquid = fl.enabled and fl.mode == "LIQUID"
+    sob = fl.surface
+    if not liquid:
+        if sob is not None:
+            sob.hide_render = sob.hide_viewport = True
+        return None
+    if sob is None or sob.name not in bpy.data.objects:
+        me = bpy.data.meshes.new(sysob.name + " Surface")
+        sob = bpy.data.objects.new(sysob.name + " Surface", me)
+        for coll in sysob.users_collection:
+            coll.objects.link(sob)
+        fl.surface = sob
+    sob.hide_render = sob.hide_viewport = False
+    mod = sob.modifiers.get("Nova Surface") or sob.modifiers.new("Nova Surface", "NODES")
+    if mod.node_group is None or mod.node_group.get("nova_v") != 3:
+        mod.node_group = liquid_tree()
+    dx = 0.05
+    if fl.domain:
+        from . import sim
+        try:
+            _res, dx, _o = sim.fluid_layout(sysob)
+        except Exception:
+            pass
+    _mod_input(mod, "System", sysob)
+    _mod_input(mod, "Radius", float(fl.surface_radius * dx))
+    _mod_input(mod, "Voxel Size", float(dx * 0.5))
+    _mod_input(mod, "Smoothing", int(fl.surface_smooth))
+    _mod_input(mod, "Offset", float(-max(0.0, fl.surface_radius - 0.9) * dx))
+    if not sob.data.materials:
+        sob.data.materials.append(water_material())
+    _mod_input(mod, "Material", sob.data.materials[0])
+    sob.matrix_world = sysob.matrix_world.copy()
+    # the water is the surface: the points stay for the viewport, out of the render
+    sysob.hide_render = True
+    sob.update_tag()
+    return sob
