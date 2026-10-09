@@ -145,6 +145,15 @@ def draw_kind_group(layout, k, n, gid):
         ref = {"death": "death_kind", "trail": "trail_kind", "split": "split_kind"}.get(gid)
         if ref and name != ref and not getattr(k, ref):
             continue
+        if gid == "life" and name == "size_curve" and n.display == "SHAPES":
+            layout.prop(k, name, text="Size Curve")
+            layout.prop(k, "shape_object")
+            row = layout.row()
+            row.prop(k, "shape_align")
+            if k.shape_align == "TUMBLE":
+                layout.prop(k, "shape_spin")
+            layout.prop(k, "shape_scale")
+            continue
         if gid == "liquid" and name != "liquid" and not k.liquid:
             continue
         if gid == "collide" and name != "collide" and k.collide == "NONE":

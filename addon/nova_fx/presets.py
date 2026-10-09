@@ -6,7 +6,7 @@ import bmesh
 import bpy
 from mathutils import Euler, Matrix, Vector
 
-from . import dissolve, lightning, render, sim
+from . import dissolve, lightning, render, shapes_display, sim
 from .params import chem
 
 # ------------------------------------------------------------------ building blocks
@@ -207,6 +207,7 @@ def day_world(context):
         try:
             sky.sun_elevation = math.radians(35)
             sky.sun_rotation = math.radians(-30)
+            sky.sun_disc = False  # the scene's own sun lamp is the sun: the sky's disc would double it
         except AttributeError:
             pass
         nt.links.new(sky.outputs["Color"], bg.inputs["Color"])
@@ -1018,6 +1019,194 @@ def build_spirit_smoke(context, coll):
     return s
 
 
+# weather -------------------------------------------------------------------
+
+def _glass_material(name="Nova Glass"):
+    mat = bpy.data.materials.get(name)
+    if mat is None:
+        mat = _plain_material(name, (1, 1, 1), 0.01)
+        b = next(n for n in mat.node_tree.nodes if n.type == "BSDF_PRINCIPLED")
+        b.inputs["Transmission Weight"].default_value = 1.0
+        b.inputs["IOR"].default_value = 1.5
+    return mat
+
+def _sun(coll, energy=3.0, rot=(50, 0, 30)):
+    sun = bpy.data.lights.new("Nova Sun", "SUN")
+    sun.energy = energy
+    ob = bpy.data.objects.new("Nova Sun", sun)
+    ob.rotation_euler = tuple(math.radians(a) for a in rot)
+    coll.objects.link(ob)
+    return ob
+
+
+def _sky_emitter(coll, s, name, kind, size, height, rate, **em):
+    sky = _mesh(coll, name, lambda bm: bmesh.ops.create_grid(bm, x_segments=1, y_segments=1, size=size / 2),
+                (0, 0, height))
+    sky.hide_render, sky.display_type = True, "WIRE"
+    return emitter(coll, s, name, kind, None, ob=sky, shape="SURFACE", rate=rate, **em)
+
+
+def _shape(coll, name, me, mat):
+    return shapes_display._object(coll, name, me, mat)
+
+
+def flake(name, size, drag, **kw):
+    d = col(name, (0.95, 0.97, 1.0), (30, 40), (size, size), 0.0, drag_lin=drag, collide="STICK", fade_out=0.02,
+            color_var=0.02)
+    d.update(kw)
+    return d
+
+
+def build_powder_snow(context, coll):
+    """Fine, dry powder: thousands of tiny flakes drifting and swirling."""
+    s = new_system(context, coll, "Powder Snow", [flake("Powder", 0.004, 6.0, size_var=0.5)],
+                   turb_amp=1.6, turb_freq=0.5, turb_speed=0.4, wind=(0.3, 0.1, 0), shading="LIT")
+    _sky_emitter(coll, s, "Powder Sky", "Powder", 12, 8, 4000, direction="RANDOM", speed=0.2)
+    ground(coll, 20)
+    _sun(coll, 2.5)
+    return s
+
+
+def build_wet_snow(context, coll):
+    """Big wet flakes: six-armed crystals that rock and tumble on the way down and lie where they land."""
+    flake_ob = _shape(coll, "Snowflake Shape", shapes_display.flake_mesh(),
+                      shapes_display.tinted_material("Nova Snowflake", (0.95, 0.97, 1.0), 0.35, sss=0.4))
+    s = new_system(context, coll, "Wet Snow", [
+        dict(flake("Flake", 0.016, 7.0, size_var=0.35), shape_object=flake_ob, shape_align="TUMBLE",
+             shape_spin=3.0),
+    ], turb_amp=0.7, turb_freq=0.4, turb_speed=0.3, wind=(0.2, 0, 0), shading="LIT", display="SHAPES")
+    _sky_emitter(coll, s, "Snow Sky", "Flake", 8, 6, 350, direction="RANDOM", speed=0.1)
+    ground(coll, 16)
+    _sun(coll, 2.5)
+    return s
+
+
+def build_blizzard(context, coll):
+    """A blizzard: snow driven sideways by a strong, gusting wind, streaking past."""
+    s = new_system(context, coll, "Blizzard", [
+        flake("Driven Snow", 0.003, 2.5, size_var=0.5, life_min=4, life_max=6, collide="NONE"),
+    ], turb_amp=4.0, turb_freq=0.25, turb_speed=1.2, wind=(11.0, 1.5, -0.5), shading="LIT", display="STREAKS",
+        streak_length=0.03)
+    box = _mesh(coll, "Blizzard Source", lambda bm: bmesh.ops.create_cube(bm, size=1.0), (-12, 0, 3))
+    box.scale = (2, 14, 6)
+    box.hide_render, box.display_type = True, "WIRE"
+    emitter(coll, s, "Blizzard Source", "Driven Snow", None, ob=box, shape="VOLUME", rate=40000,
+            direction="RANDOM", speed=2.0)
+    ground(coll, 40)
+    _sun(coll, 1.2, (70, 0, 20))
+    return s
+
+
+def build_sleet(context, coll):
+    """Sleet: icy pellets falling fast, bouncing off the ground and chipping."""
+    pellet = _shape(coll, "Sleet Shape", shapes_display.pellet_mesh(),
+                    shapes_display.tinted_material("Nova Ice", (0.85, 0.9, 0.95), 0.08, trans=0.6))
+    s = new_system(context, coll, "Sleet", [
+        dict(col("Pellet", (0.9, 0.95, 1.0), (4, 6), (0.0025, 0.0025), 0.0, drag_quad=0.12, collide="BOUNCE",
+                 bounce=0.45, friction=0.3, hit_kind="Ice Chip", hit_count=0.6, hit_speed=1.0, color_var=0.0),
+             shape_object=pellet, shape_align="TUMBLE"),
+        dict(col("Ice Chip", (0.9, 0.95, 1.0), (0.3, 0.8), (0.0012, 0.0012), 0.0, drag_quad=0.5, collide="BOUNCE",
+                 bounce=0.2, color_var=0.0), shape_object=pellet, shape_align="TUMBLE"),
+    ], turb_amp=0.4, turb_freq=0.3, wind=(1.0, 0, 0), shading="LIT", display="SHAPES", substeps=2)
+    _sky_emitter(coll, s, "Sleet Sky", "Pellet", 8, 7, 2500, direction="RANDOM", speed=0.5)
+    ground(coll, 16)
+    _sun(coll, 2.0)
+    return s
+
+
+def build_snow_globe(context, coll):
+    """A shaken snow globe: flakes swirl inside the glass and settle slowly on the little scene inside."""
+    flake_ob = _shape(coll, "Globe Flake Shape", shapes_display.flake_mesh("Nova Globe Flake"),
+                      shapes_display.tinted_material("Nova Snowflake", (0.95, 0.97, 1.0), 0.35, sss=0.4))
+    f0 = context.scene.frame_start
+    s = new_system(context, coll, "Snow Globe", [
+        dict(flake("Globe Flake", 0.006, 4.0, size_var=0.4), shape_object=flake_ob, shape_align="TUMBLE",
+             shape_spin=20.0),
+    ], gravity=(0, 0, -1.5), turb_amp=1.2, turb_freq=3.0, turb_speed=0.8, shading="LIT", display="SHAPES")
+    # the glass and the scene inside it (the flakes move in liquid: weak gravity, strong drag)
+    glass = _mesh(coll, "Globe Glass", lambda bm: bmesh.ops.create_uvsphere(bm, u_segments=48, v_segments=24,
+                                                                          radius=0.5), (0, 0, 0.62),
+                  mat=_glass_material())
+    for p in glass.data.polygons:
+        p.use_smooth = True
+    glass.nova_collider.enabled, glass.nova_collider.shape = True, "SHELL"
+    base = _mesh(coll, "Globe Base", lambda bm: bmesh.ops.create_cone(bm, cap_ends=True, segments=48, radius1=0.42,
+                                                                      radius2=0.36, depth=0.2), (0, 0, 0.1),
+                 mat=_plain_material("Nova Globe Base", (0.12, 0.05, 0.03), 0.4))
+    floor = _mesh(coll, "Globe Floor", lambda bm: bmesh.ops.create_circle(bm, cap_ends=True, segments=48,
+                                                                          radius=0.44), (0, 0, 0.26),
+                  mat=_plain_material("Nova Globe Snow", (0.9, 0.92, 0.95), 0.7))
+    floor.nova_collider.enabled, floor.nova_collider.shape = True, "PLANE"
+    tree = _mesh(coll, "Globe Tree", lambda bm: bmesh.ops.create_cone(bm, cap_ends=True, segments=12, radius1=0.1,
+                                                                      radius2=0.0, depth=0.32), (0.05, 0.05, 0.42),
+                 mat=_plain_material("Nova Globe Tree", (0.03, 0.18, 0.06), 0.6))
+    tree.nova_collider.enabled, tree.nova_collider.shape = True, "MESH"
+    emitter(coll, s, "Globe Shake", "Globe Flake", (0, 0, 0.4), size=0.3, shape="SPHERE", radius=0.3, rate=0,
+            burst=4000, burst_frame=f0, direction="RANDOM", speed=1.4, speed_var=0.6)
+    _light(coll, "Nova Key", "AREA", 60.0, (-0.8, -1.0, 1.4), (0, 0, 0.6), 0.6, (1.0, 0.95, 0.9))
+    _light(coll, "Nova Rim", "AREA", 40.0, (0.7, 0.9, 1.0), (0, 0, 0.6), 0.5, (0.7, 0.8, 1.0))
+    return s
+
+
+def build_rain(context, coll):
+    """Rain: streaking drops that burst into splashes on a wet surface; the splashes ring it with ripples."""
+    water = shapes_display.tinted_material("Nova Rain", (0.8, 0.85, 0.9), 0.05, trans=0.9)
+    drop = _shape(coll, "Raindrop Shape", shapes_display.drop_mesh(), water)
+    pellet = _shape(coll, "Splash Shape", shapes_display.pellet_mesh("Nova Splash Drop"), water)
+    ring = _shape(coll, "Ripple Shape", shapes_display.ripple_mesh(),
+                  shapes_display.tinted_material("Nova Ripple", (0.75, 0.8, 0.85), 0.05))
+    s = new_system(context, coll, "Rain", [
+        dict(col("Rain", (1, 1, 1), (3, 3), (0.12, 0.12), 0.0, drag_quad=0.02, collide="DIE", hit_kind="Splash",
+                 hit_count=4, hit_speed=1.4, color_var=0.0), shape_object=drop, shape_align="VELOCITY",
+             shape_scale=1.6),
+        dict(col("Splash", (1, 1, 1), (0.2, 0.5), (0.0025, 0.0015), 0.0, collide="DIE", hit_kind="Ripple",
+                 hit_count=0.5, hit_speed=0.0, color_var=0.0), shape_object=pellet, shape_align="UP"),
+        dict(col("Ripple", (1, 1, 1), (0.5, 0.9), (0.005, 0.09), 0.0, gravity=0.0, drag_lin=60.0, collide="STICK",
+                 size_curve=0.6, color_var=0.0), shape_object=ring, shape_align="FLAT"),
+    ], wind=(0.6, 0, 0), shading="LIT", display="SHAPES", substeps=2)
+    _sky_emitter(coll, s, "Rain Sky", "Rain", 8, 7, 3000, direction="RANDOM", speed=0.0)
+    for ob in s.users_collection[0].objects:
+        if ob.name == "Rain Sky":
+            ob.nova_emitter.direction, ob.nova_emitter.speed = "OBJECT_Z", 0.0
+    s.nova.kinds["Rain"].life_min = s.nova.kinds["Rain"].life_max = 3.0
+    puddle = ground(coll, 16)
+    puddle.data.materials[0] = _plain_material("Nova Wet Ground", (0.04, 0.04, 0.045), 0.05)
+    _sun(coll, 0.8, (60, 0, 30))
+    return s
+
+
+def build_sakura(context, coll):
+    """Cherry blossoms: pink petals drift on the breeze, fluttering as they fall, and gather on the ground."""
+    petal = _shape(coll, "Petal Shape", shapes_display.petal_mesh(),
+                   shapes_display.tinted_material("Nova Petal", (1, 1, 1), 0.45, sss=0.3))
+    s = new_system(context, coll, "Cherry Blossoms", [
+        dict(col("Petal", (1.0, 0.72, 0.8), (20, 30), (0.016, 0.016), 0.0, drag_lin=3.5, collide="STICK",
+                 color_var=0.15, size_var=0.3, fade_out=0.02, turb=1.4), shape_object=petal, shape_align="TUMBLE",
+             shape_spin=9.0),
+    ], turb_amp=2.0, turb_freq=0.7, turb_speed=0.6, wind=(1.4, 0.4, 0), shading="LIT", display="SHAPES")
+    canopy = emitter(coll, s, "Blossom Canopy", "Petal", (-2.5, 0, 4), size=1.5, scale=(2.0, 2.0, 0.8),
+                     shape="SPHERE", radius=1.5, rate=450, direction="RANDOM", speed=0.4)
+    ground(coll, 20).data.materials[0] = _plain_material("Nova Grass", (0.1, 0.18, 0.06), 0.8)
+    _sun(coll, 1.4, (45, 0, -40))
+    return s
+
+
+def build_autumn(context, coll):
+    """Autumn leaves in reds, oranges and yellows tumble down on a gusting wind and settle on the ground."""
+    leaf = _shape(coll, "Leaf Shape", shapes_display.leaf_mesh(),
+                  shapes_display.tinted_material("Nova Leaf", (1, 1, 1), 0.55, sss=0.15))
+    s = new_system(context, coll, "Autumn Leaves", [
+        dict(col("Leaf", (0.95, 0.42, 0.08), (20, 30), (0.05, 0.05), 0.0, drag_lin=2.6, collide="STICK",
+                 color_var=0.35, hue_random=0.07, size_var=0.25, fade_out=0.02, turb=1.2), shape_object=leaf,
+             shape_align="TUMBLE", shape_spin=5.0),
+    ], turb_amp=1.6, turb_freq=0.5, turb_speed=0.5, wind=(1.0, 0, 0), shading="LIT", display="SHAPES")
+    emitter(coll, s, "Tree Crown", "Leaf", (-2, 0, 4.5), size=1.8, scale=(2.2, 2.2, 1.0), shape="SPHERE",
+            radius=1.8, rate=150, direction="RANDOM", speed=0.3)
+    ground(coll, 20).data.materials[0] = _plain_material("Nova Earth", (0.12, 0.08, 0.05), 0.85)
+    _sun(coll, 1.5, (40, 0, 30))
+    return s
+
+
 def build_empty(context, coll):
     s = new_system(context, coll, "Nova System", [
         dict(name="Particle", color_mode="BLACKBODY", temp0=2400, life_min=1, life_max=2, emit=20),
@@ -1039,6 +1228,17 @@ PRESETS = [
     ("EMBERS", "Drifting Embers", "Ambient embers carried by wind and heat", build_embers),
     ("VORTEX", "Energy Vortex", "Particles swirling around a vortex force", build_vortex),
     ("SNOW", "Snow", "Lit snowfall that settles", build_snow),
+    ("POWDER", "Powder Snow", "Fine dry powder drifting and swirling", build_powder_snow),
+    ("WETSNOW", "Wet Snow", "Big six-armed flakes that rock and tumble down and lie where they land",
+     build_wet_snow),
+    ("BLIZZARD", "Blizzard", "Snow driven sideways by a strong gusting wind", build_blizzard),
+    ("SLEET", "Sleet", "Icy pellets that fall fast, bounce and chip", build_sleet),
+    ("GLOBE", "Snow Globe", "A shaken snow globe: flakes swirl inside the glass and settle", build_snow_globe),
+    ("RAIN", "Rain", "Streaking rain that splashes and rings a wet surface with ripples", build_rain),
+    ("SAKURA", "Cherry Blossoms", "Pink petals drift and flutter on the breeze and gather on the ground",
+     build_sakura),
+    ("AUTUMN", "Autumn Leaves", "Red, orange and yellow leaves tumble down on the wind and settle",
+     build_autumn),
     ("LIGHTNING", "Lightning", "Branching cloud-to-ground strike: stepped leader, return strokes, afterglow",
      build_lightning),
     ("FORMATION", "Particle Logo", "Dust assembles into a word (any text, logo or mesh), holds, then scatters",
@@ -1094,6 +1294,14 @@ STAGES = {
     "FORMATION": ((0, -9, 1.3), (0, 0, 1.2), 35, True),
     "DISINTEGRATE": ((0, -4.2, 1.3), (0, 0, 1.15), 45, True),
     "PORTAL": ((0.6, -5.2, 1.4), (0, 0, 1.4), 35, True),
+    "POWDER": ((0, -5, 1.6), (0, 0, 1.8), 35, "DUSK"),
+    "WETSNOW": ((0, -2.6, 1.3), (0, 0, 1.2), 40, "DUSK"),
+    "BLIZZARD": ((6, -8, 1.6), (0, 0, 1.6), 28, "DUSK"),
+    "SLEET": ((0, -5, 1.2), (0, 0, 0.8), 35, "DUSK"),
+    "GLOBE": ((0, -2.2, 0.75), (0, 0, 0.55), 50, "DUSK"),
+    "RAIN": ((0, -6, 1.0), (0, 0, 0.5), 32, "DUSK"),
+    "SAKURA": ((0.5, -4.2, 1.6), (-0.6, 0, 1.9), 35, "DAY"),
+    "AUTUMN": ((0.5, -4.2, 1.6), (-0.6, 0, 1.8), 35, "DAY"),
     "SPELL": ((0, -3.6, 2.9), (0, 0, 0.1), 32, True),
     "WISPS": ((0, -5.0, 1.3), (0, 0, 1.0), 35, True),
     "ORB": ((0, -4.0, 1.5), (0, 0, 1.4), 40, True),

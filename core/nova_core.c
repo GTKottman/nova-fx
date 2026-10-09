@@ -315,7 +315,7 @@ typedef struct {
 #define MAXSDF 32
 
 typedef struct {
-  int type; /* 0 plane, 1 sphere, 2 box, 3 mesh (signed distance field; ext[0] = sdf slot) */
+  int type; /* 0 plane, 1 sphere, 2 box, 3 mesh (signed distance field; ext[0] = sdf slot), 4 inside of a sphere */
   float m[12], mi[12]; /* world->local, local->world (3x4 row major) */
   float ext[3];        /* sphere: radius in [0]; box: half extents */
   float vel[3];
@@ -2229,6 +2229,13 @@ static int collider_test(const NvSys *s, const Collider *C, const float *p, floa
       ln[k] = l[k] / d;
       lp[k] = ln[k] * r;
     }
+  } else if (C->type == 4) { /* a hollow sphere (a snow globe): keeps particles inside */
+    float r = C->ext[0], d = sqrtf(l[0] * l[0] + l[1] * l[1] + l[2] * l[2]);
+    if (d <= r) return 0;
+    for (int k = 0; k < 3; k++) {
+      ln[k] = -l[k] / d;
+      lp[k] = -ln[k] * r;
+    }
   } else if (C->type == 3) {
     int slot = (int)C->ext[0];
     if (slot < 0 || slot >= MAXSDF || !s->sdf[slot].d) return 0;
@@ -2276,6 +2283,7 @@ static float collider_dist(const NvSys *s, const Collider *C, const float *p) {
   xf(C->m, p, l);
   if (C->type == 0) return l[2] * C->pinv;
   if (C->type == 1) return (sqrtf(l[0] * l[0] + l[1] * l[1] + l[2] * l[2]) - C->ext[0]) * C->smin;
+  if (C->type == 4) return (C->ext[0] - sqrtf(l[0] * l[0] + l[1] * l[1] + l[2] * l[2])) * C->smin;
   if (C->type == 2) {
     float q[3], o = 0.f, mx = -1e30f;
     for (int a = 0; a < 3; a++) {
@@ -2317,7 +2325,8 @@ static void collider_aabb_s(const NvSys *s, const Collider *C, float *lo, float 
     int nn[3] = {S->nx, S->ny, S->nz};
     for (int a = 0; a < 3; a++) { e0[a] = S->o[a]; e1[a] = S->o[a] + (nn[a] - 1) * S->dx; }
   } else {
-    float e[3] = {C->ext[0], C->type == 1 ? C->ext[0] : C->ext[1], C->type == 1 ? C->ext[0] : C->ext[2]};
+    int round = C->type == 1 || C->type == 4;
+    float e[3] = {C->ext[0], round ? C->ext[0] : C->ext[1], round ? C->ext[0] : C->ext[2]};
     for (int a = 0; a < 3; a++) { e0[a] = -e[a]; e1[a] = e[a]; }
   }
   for (int a = 0; a < 3; a++) { lo[a] = 1e30f; hi[a] = -1e30f; }
@@ -2681,7 +2690,9 @@ API void nv_sys_step(NvSys *s, float dt) {
     const uint32_t id = P->id[i];
     const int liq = K[KP_liquid] > 0.5f && s->fluid && s->fluid->fp[FP_liquid] > 0.5f;
     int hit = 0, cm = (int)K[KP_collide];
-    if (!liq) { /* liquid particles are moved by the liquid solver (nv_liquid_substep) */
+    /* gen bit 7 marks a particle that stuck (collide = Stick): it stays where it landed */
+    if (P->gen[i] & 128) { P->vx[i] = P->vy[i] = P->vz[i] = 0.f; }
+    if (!liq && !(P->gen[i] & 128)) { /* liquid particles are moved by the liquid solver (nv_liquid_substep) */
     float gs = K[KP_gravity];
     float ax = G[0] * gs, ay = G[1] * gs, az = G[2] * gs;
     az += K[KP_buoyancy] * (P->temp[i] - Ta) * 0.001f;
@@ -2813,6 +2824,11 @@ API void nv_sys_step(NvSys *s, float dt) {
         float rx = vx - cv[0], ry = vy - cv[1], rz = vz - cv[2];
         float vn = rx * nn[0] + ry * nn[1] + rz * nn[2];
         if (vn < -0.5f) hit = 1; /* a real impact, not a particle resting on the surface */
+        if (cm == 3) { /* stick: it stays here from now on */
+          P->gen[i] |= 128;
+          vx = cv[0]; vy = cv[1]; vz = cv[2];
+          break;
+        }
         if (vn < 0.f) {
           float tx = rx - vn * nn[0], ty = ry - vn * nn[1], tz = rz - vn * nn[2];
           float fr = cm == 3 ? 1.f : K[KP_friction], bo = cm == 3 ? 0.f : K[KP_bounce];
@@ -2848,7 +2864,7 @@ API void nv_sys_step(NvSys *s, float dt) {
     P->age[i] = age;
 
     /* events */
-    int gen = P->gen[i];
+    int gen = P->gen[i] & 127;
     uint32_t ec = 0;
     uint16_t nt = 0, nd = 0;
     uint8_t ns = 0, nh = 0, dead = 0;
@@ -2913,7 +2929,7 @@ API void nv_sys_step(NvSys *s, float dt) {
       const uint32_t pid = P->id[i];
       float pos[3] = {P->x[i], P->y[i], P->z[i]}, pv[3] = {P->vx[i], P->vy[i], P->vz[i]};
       float rgb[3] = {P->cr[i], P->cg[i], P->cb[i]};
-      int gen = P->gen[i] + 1;
+      int gen = (P->gen[i] & 127) + 1;
       float sp = sqrtf(pv[0] * pv[0] + pv[1] * pv[1] + pv[2] * pv[2]);
       (void)sp;
       int nt = s->ev_trail[i], nh = s->ev_hit[i], ns = s->ev_split[i], nd = s->ev_death[i];
