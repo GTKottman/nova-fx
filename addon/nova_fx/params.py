@@ -22,6 +22,15 @@ PATTERNS = [
     ("SHAPE", "Shape", "Burst into the shape of an object: a logo, text, any mesh or curve. With linear drag "
                        "the stars stop exactly in the shape; its size = burst speed / linear drag"),
 ]
+LIQ_CONTACT = [
+    ("NONE", "Nothing", "Liquid does not affect it"),
+    ("DIE", "Dies", "Dies on touching the liquid (spray falling back: give it a death burst of foam)"),
+    ("RIDE", "Rides", "Moves with the liquid's flow while in it (foam)"),
+]
+AIR_CONTACT = [
+    ("NONE", "Nothing", "Air does not affect it"),
+    ("DIE", "Dies", "Dies when it leaves the liquid (a bubble popping at the surface)"),
+]
 COLLIDE = [
     ("NONE", "Pass Through", "Ignore colliders"),
     ("BOUNCE", "Bounce", "Bounce off colliders"),
@@ -47,6 +56,8 @@ KIND_SPEC = [
     ("wind", "F", 1.0, dict(soft_min=0, soft_max=2, group="motion", desc="How much the system wind applies")),
     ("force", "F", 1.0, dict(soft_min=0, soft_max=5, group="motion", desc="How strongly force objects act on this type")),
     ("fluid_drag", "F", 0.0, dict(min=0, soft_max=20, group="motion", desc="Ride the fluid: pull toward the fluid velocity (1/s)")),
+    ("liq_contact", "E", "NONE", dict(items=LIQ_CONTACT, group="motion", desc="What touching a liquid does to it")),
+    ("air_contact", "E", "NONE", dict(items=AIR_CONTACT, group="motion", desc="What leaving a liquid does to it")),
     ("liquid", "B", False, dict(group="liquid", desc="Part of a liquid: the liquid solver moves it (Fire & Smoke in Liquid "
                                                      "mode). Give it a long life")),
     ("viscosity", "F", 0.0, dict(min=0, soft_max=500, group="liquid",
@@ -59,6 +70,14 @@ KIND_SPEC = [
                                desc="Heat spreading between neighbours (1/s): a heated spot warms the rest")),
     ("crust", "F", 0.0, dict(min=0, soft_max=20, group="liquid",
                              desc="Cooling at the surface only (1/s): lava grows a dark, stiff skin")),
+    ("spray_kind", "K", "", dict(group="liquid", desc="Whitewater: fast liquid at the surface throws this type")),
+    ("spray_rate", "F", 0.0, dict(min=0, soft_max=50, group="liquid",
+                                  desc="Spray per surface particle per second, at twice the threshold speed")),
+    ("bubble_kind", "K", "", dict(group="liquid", desc="Whitewater: fast liquid below the surface traps this type")),
+    ("bubble_rate", "F", 0.0, dict(min=0, soft_max=50, group="liquid",
+                                   desc="Bubbles per particle per second, at twice the threshold speed")),
+    ("ww_speed", "F", 1.5, dict(min=0.01, soft_max=10, unit="VELOCITY", group="liquid",
+                                desc="Whitewater starts above this speed and is strongest at twice it")),
 
     ("color_mode", "E", "FIXED", dict(items=COLOR_MODES, group="color", desc="How colour is decided")),
     ("color", "C", (1.0, 0.6, 0.2), dict(group="color", desc="Colour (start colour for Gradient)")),
@@ -127,6 +146,8 @@ ENUM_INDEX = {
     "color_mode": [i[0] for i in COLOR_MODES],
     "death_pattern": [i[0] for i in PATTERNS],
     "collide": [i[0] for i in COLLIDE],
+    "liq_contact": [i[0] for i in LIQ_CONTACT],
+    "air_contact": [i[0] for i in AIR_CONTACT],
 }
 
 

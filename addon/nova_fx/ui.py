@@ -290,6 +290,8 @@ class NOVA_PT_fluid(_Panel, bpy.types.Panel):
             if fl.gas_look == "SPIRIT":
                 body.prop(fl, "spirit_color")
                 body.prop(fl, "spirit_color2")
+            if fl.gas_look == "INK":
+                body.prop(fl, "ink_color")
             for name in ("density_mult", "smoke_color", "flame_mult", "heat_mult", "temp_scale", "write_velocity"):
                 body.prop(fl, name)
 

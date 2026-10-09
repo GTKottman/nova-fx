@@ -1207,6 +1207,91 @@ def build_autumn(context, coll):
     return s
 
 
+# liquid effects ------------------------------------------------------------
+
+def build_splatter(context, coll):
+    """Blood splatter: a spray of drops that break up in flight and leave ragged stains where they land, flat on
+    the wall and the floor alike."""
+    blood = shapes_display.tinted_material("Nova Blood Drop", (1, 1, 1), 0.12)
+    drop = _shape(coll, "Blood Drop Shape", shapes_display.pellet_mesh("Nova Blood Pellet"), blood)
+    splat = _shape(coll, "Stain Shape", shapes_display.splat_mesh(), blood)
+    f0 = context.scene.frame_start
+    s = new_system(context, coll, "Blood Splatter", [
+        dict(col("Drop", (0.22, 0.0, 0.01), (2, 3), (0.004, 0.004), 0.0, drag_quad=0.15, collide="DIE",
+                 hit_kind="Stain", hit_count=1, hit_speed=0.0, color_var=0.05, size_var=0.6, split_kind="Drop",
+                 split_rate=1.5, split_count=2, split_speed=0.6, split_inherit=0.9, split_max_gen=2),
+             shape_object=drop, shape_align="VELOCITY", shape_scale=1.0),
+        dict(col("Stain", (0.16, 0.0, 0.008), (60, 60), (0.012, 0.012), 0.0, gravity=0.0, collide="STICK",
+                 color_var=0.05, size_var=0.6, fade_out=0.0), shape_object=splat, shape_align="VELOCITY"),
+    ], shading="LIT", display="SHAPES", substeps=3)
+    wall_mat = _plain_material("Nova Plaster", (0.75, 0.74, 0.72), 0.7)
+    floor = ground(coll, 6)
+    floor.data.materials[0] = _plain_material("Nova Concrete Floor", (0.55, 0.54, 0.52), 0.6)
+    wall = _mesh(coll, "Wall", lambda bm: bmesh.ops.create_grid(bm, x_segments=1, y_segments=1, size=1.5),
+                 (0, 0.9, 1.5), (math.radians(90), 0, 0), wall_mat)
+    wall.nova_collider.enabled, wall.nova_collider.shape = True, "PLANE"  # turned +90 about X: +Z faces the room
+    emitter(coll, s, "Impact", "Drop", (0, -0.4, 1.3), (math.radians(-70), 0, 0), "SINGLE_ARROW", 0.3,
+            shape="SPHERE", radius=0.03, direction="OBJECT_Z", spread=0.32, rate=0, burst=2200, burst_frame=f0 + 2,
+            speed=6.5, speed_var=0.6)
+    _sun(coll, 2.0, (55, 0, -25))
+    return s
+
+
+def build_ink(context, coll):
+    """Ink dropped into a tank of still water sinks in curling, billowing tendrils."""
+    s = new_system(context, coll, "Ink", [
+        dict(name="Speck", color_mode="FIXED", color=(0.05, 0.1, 0.5), life_min=1, life_max=1, emit=0.0,
+             collide="NONE"),
+    ], fluid=dict(buoy_heat=0.0, buoy_smoke=0.5, vorticity=1.6, turb_amp=0.5, turb_freq=12.0, turb_speed=0.3,
+                  smoke_decay=0.0, cool=0.0, burn_rate=0.0, density_mult=400.0, gas_look="INK",
+                  ink_color=(0.02, 0.05, 0.45), closed_floor=True))
+    domain(coll, s, (0.44, 0.44, 0.64), (0, 0, 0.34), 128)
+    f0 = context.scene.frame_start
+    emitter(coll, s, "Ink Drop", "", (0.02, 0.0, 0.62), (math.radians(180), 0, 0), "SINGLE_ARROW", 0.05,
+            shape="SPHERE", radius=0.012, rate=0, direction="OBJECT_Z", fl_enabled=True, fl_density=3.0,
+            fl_heat=0.0, fl_fuel=0.0, fl_speed=0.35, fl_noise=0.3, frame_end=f0 + 24)
+    # backlit on white, the way ink-in-water is photographed (a glass tank would only frost and soften it)
+    _light(coll, "Nova Backlight", "AREA", 120.0, (0, 0.9, 0.4), (0, 0, 0.35), 0.8)
+    _light(coll, "Nova Key", "AREA", 40.0, (-0.8, -0.8, 0.8), (0, 0, 0.35), 0.5)
+    back = _mesh(coll, "Backdrop", lambda bm: bmesh.ops.create_grid(bm, x_segments=1, y_segments=1, size=1.0),
+                 (0, 0.6, 0.5), (math.radians(90), 0, 0), _plain_material("Nova White Sweep", (0.95, 0.95, 0.95), 0.6))
+    back.scale = (2, 1, 1)
+    return s
+
+
+def build_whitewater(context, coll):
+    """A wall of water crashes over a block: spray thrown off the crest, foam riding the surface, bubbles rising."""
+    white = (0.95, 0.97, 1.0)
+    s = new_system(context, coll, "Whitewater", [
+        dict(name="Water", liquid=True, color_mode="FIXED", color=(0.25, 0.5, 0.9), life_min=1e5, life_max=1e5,
+             size_start=0.01, size_end=0.01, size_var=0.0, emit=0.0, fade_in=0.0, fade_out=0.0, collide="BOUNCE",
+             spray_kind="Spray", spray_rate=6.0, bubble_kind="Bubble", bubble_rate=1.5, ww_speed=1.4),
+        col("Spray", white, (0.6, 1.4), (0.004, 0.002), 0.0, drag_quad=0.6, liq_contact="DIE", death_kind="Foam",
+            death_count=1, death_speed=0.0, death_inherit=0.2, collide="DIE", color_var=0.0, fade_out=0.2),
+        col("Foam", white, (2.0, 4.0), (0.006, 0.004), 0.0, liq_contact="RIDE", collide="STICK", color_var=0.0,
+            fade_out=0.4, size_var=0.5),
+        col("Bubble", white, (1.0, 2.5), (0.003, 0.003), 0.0, gravity=-0.4, fluid_drag=6.0, air_contact="DIE",
+            collide="NONE", color_var=0.0, fade_out=0.1),
+    ], frame_end=min(context.scene.frame_end, 160), substeps=1, shading="LIT")
+    domain(coll, s, (3.0, 1.0, 1.4), (0, 0, 0.7), 96, mode="LIQUID", flip=0.95, walls="TANK", cfl=1.0, max_sub=8)
+    dx = 3.0 / 96
+    block = _mesh(coll, "Water Wall", lambda bm: bmesh.ops.create_cube(bm, size=1.0), (-1.15, 0, 0.5))
+    block.scale = (0.6, 0.94, 0.95)
+    block.display_type, block.hide_render = "WIRE", True
+    emitter(coll, s, "Water Wall", "Water", None, ob=block, shape="VOLUME", rate=0,
+            burst=int(0.6 * 0.94 * 0.95 / dx ** 3 * 8), burst_frame=s.nova.frame_start, direction="RANDOM",
+            speed=0.0, speed_var=0.0)
+    rock = _mesh(coll, "Breakwater", lambda bm: bmesh.ops.create_cube(bm, size=1.0), (0.35, 0, 0.18),
+                 mat=_plain_material("Nova Stone", (0.18, 0.17, 0.16), 0.5))
+    rock.scale = (0.3, 0.94, 0.36)
+    rock.nova_collider.enabled, rock.nova_collider.shape = True, "BOX"
+    floor = ground(coll, 8)  # spray thrown out of the tank lands here (and dies)
+    floor.data.materials[0] = _plain_material("Nova Wet Ground", (0.04, 0.04, 0.045), 0.05)
+    _sun(coll, 3.0, (50, 0, -30))
+    render.sync_liquid(s)
+    return s
+
+
 def build_empty(context, coll):
     s = new_system(context, coll, "Nova System", [
         dict(name="Particle", color_mode="BLACKBODY", temp0=2400, life_min=1, life_max=2, emit=20),
@@ -1259,6 +1344,11 @@ PRESETS = [
      build_arcane_orb),
     ("SPIRIT", "Spirit Smoke", "Glowing mist that shines where it is fresh and fades violet, with motes",
      build_spirit_smoke),
+    ("SPLATTER", "Blood Splatter", "A spray of blood drops that break up in flight and stain the wall and floor",
+     build_splatter),
+    ("INK", "Ink in Water", "Ink dropped into still water sinks in curling, billowing tendrils", build_ink),
+    ("WHITEWATER", "Whitewater", "A wall of water crashes over a block: spray, foam riding the surface, bubbles",
+     build_whitewater),
     ("DISINTEGRATE", "Burn Away", "An object burns away along a ragged glowing front, shedding embers and ash",
      build_disintegrate),
     ("EMPTY", "Empty System", "One type, one emitter: start from scratch", build_empty),
@@ -1294,6 +1384,9 @@ STAGES = {
     "FORMATION": ((0, -9, 1.3), (0, 0, 1.2), 35, True),
     "DISINTEGRATE": ((0, -4.2, 1.3), (0, 0, 1.15), 45, True),
     "PORTAL": ((0.6, -5.2, 1.4), (0, 0, 1.4), 35, True),
+    "SPLATTER": ((0.9, -1.9, 1.35), (0, 0.6, 0.9), 35, "DAY"),
+    "INK": ((0, -1.25, 0.36), (0, 0, 0.34), 45, "DAY"),
+    "WHITEWATER": ((0.6, -4.2, 1.4), (0, 0, 0.4), 32, "DAY"),
     "POWDER": ((0, -5, 1.6), (0, 0, 1.8), 35, "DUSK"),
     "WETSNOW": ((0, -2.6, 1.3), (0, 0, 1.2), 40, "DUSK"),
     "BLIZZARD": ((6, -8, 1.6), (0, 0, 1.6), 28, "DUSK"),

@@ -21,7 +21,9 @@
   X(split_inherit, 0.7) X(split_max_gen, 3)                                               \
   X(hit_kind, -1) X(hit_count, 0) X(hit_speed, 2)                                         \
   X(fl_smoke, 0) X(fl_heat, 0) X(fl_fuel, 0) X(liquid, 0)                                \
-  X(viscosity, 0) X(visc_temp, 0) X(conduct, 0) X(crust, 0)
+  X(viscosity, 0) X(visc_temp, 0) X(conduct, 0) X(crust, 0)                               \
+  X(spray_kind, -1) X(bubble_kind, -1) X(spray_rate, 0) X(bubble_rate, 0) X(ww_speed, 1.5)  \
+  X(liq_contact, 0) X(air_contact, 0)
 
 /* Global particle-system parameters. */
 #define SYS_PARAMS(X)                                                                     \
