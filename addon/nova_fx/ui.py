@@ -287,6 +287,13 @@ class NOVA_PT_emitter(_Panel, bpy.types.Panel):
             layout.prop(e, "spread")
         layout.prop(e, "inherit")
         layout.prop(e, "seed")
+        header, body = layout.panel("nova_emitter_music", default_closed=not e.music.enabled)
+        header.prop(e.music, "enabled", text="Music")
+        if body:
+            body.active = e.music.enabled
+            draw_trigger(body, e.music, emitter=True)
+            if e.music.mode == "BURST" and e.rate > 0:
+                body.label(text="Rate still emits between hits", icon="INFO")
         header, body = layout.panel("nova_emitter_fluid", default_closed=not e.fl_enabled)
         header.prop(e, "fl_enabled", text="Fluid Source")
         if body:
@@ -331,6 +338,43 @@ class NOVA_PT_force(_Panel, bpy.types.Panel):
             layout.prop(f, "freq")
 
 
+def draw_trigger(layout, t, emitter=False):
+    """The shared music trigger settings (emitters and bolts)."""
+    layout.prop(t, "source")
+    if t.source == "MIDI":
+        layout.prop(t, "notes")
+        row = layout.row(align=True)
+        row.prop(t, "channel")
+        row.prop(t, "track")
+    elif not (emitter and t.mode == "RATE"):
+        layout.prop(t, "threshold")
+    if emitter:
+        layout.prop(t, "mode")
+    if not (emitter and t.mode == "RATE"):
+        col = layout.column(align=True)
+        col.prop(t, "min_gap")
+        col.prop(t, "every")
+        col.prop(t, "offset")
+    if emitter and t.mode == "BURST":
+        col = layout.column(align=True)
+        col.prop(t, "count")
+        col.prop(t, "response")
+        layout.prop(t, "land")
+    elif emitter:
+        col = layout.column(align=True)
+        if t.source != "MIDI":
+            col.prop(t, "attack")
+        col.prop(t, "release")
+    n = len(t.hits)
+    if emitter and t.mode == "RATE":
+        msg = f"Rate follows {n} frames" if n else "Not synced yet"
+    else:
+        msg = f"{n} hits, first at frame {t.hits[0].frame:.1f}" if n else "Not synced yet"
+    row = layout.row()
+    row.label(text=msg, icon="CHECKMARK" if n else "INFO")
+    row.operator("nova.music_sync", text="", icon="FILE_REFRESH")
+
+
 class NOVA_PT_lightning(_Panel, bpy.types.Panel):
     bl_label = "Lightning"
 
@@ -370,6 +414,70 @@ class NOVA_PT_lightning(_Panel, bpy.types.Panel):
         if body:
             for prop in ("brightness", "branch_glow", "temperature", "light_power", "impact"):
                 body.prop(lt, prop)
+        header, body = layout.panel("nova_lightning_music", default_closed=not lt.music.enabled)
+        header.prop(lt.music, "enabled", text="Strike on the Music")
+        if body:
+            body.active = lt.music.enabled
+            draw_trigger(body, lt.music)
+            body.prop(lt, "music_spread")
+
+
+class NOVA_UL_drives(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_prop, index=0):
+        name = item.target.name if item.target else "(no object)"
+        layout.label(text=f"{name} · {item.path}", icon="SOUND")
+
+
+class NOVA_PT_music(_Panel, bpy.types.Panel):
+    bl_label = "Music"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        m = context.scene.nova_music
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        layout.prop(m, "audio")
+        layout.prop(m, "midi")
+        layout.prop(m, "start_frame")
+        layout.prop(m, "sound_strip")
+        row = layout.row()
+        row.scale_y = 1.4
+        row.operator("nova.music_sync", icon="SOUND")
+        if m.info:
+            layout.label(text=m.info, icon="INFO")
+        header, body = layout.panel("nova_music_drives", default_closed=not m.drives)
+        header.label(text="Drive Properties")
+        if body is None:
+            return
+        row = body.row()
+        row.template_list("NOVA_UL_drives", "", m, "drives", m, "drives_index", rows=3)
+        col = row.column(align=True)
+        col.operator("nova.music_drive_add", text="", icon="ADD")
+        col.operator("nova.music_drive_remove", text="", icon="REMOVE")
+        if not m.drives:
+            body.label(text="Select an object, then +", icon="INFO")
+            return
+        d = m.drives[min(m.drives_index, len(m.drives) - 1)]
+        body.prop(d, "target")
+        body.prop(d, "path")
+        row = body.row(align=True)
+        row.prop(d, "low")
+        row.prop(d, "high")
+        body.prop(d, "shape", expand=True)
+        body.prop(d, "source")
+        if d.source == "MIDI":
+            body.prop(d, "notes")
+            row = body.row(align=True)
+            row.prop(d, "channel")
+            row.prop(d, "track")
+        elif d.shape == "PULSE":
+            body.prop(d, "threshold")
+        if d.shape == "PULSE":
+            body.prop(d, "every")
+        elif d.source != "MIDI":
+            body.prop(d, "attack")
+        body.prop(d, "release")
 
 
 class NOVA_MT_add(bpy.types.Menu):
@@ -387,4 +495,5 @@ def menu_add(self, context):
 
 
 CLASSES = (NOVA_UL_kinds, NOVA_PT_main, NOVA_PT_system, NOVA_PT_types, NOVA_PT_forces, NOVA_PT_fluid,
-           NOVA_PT_display, NOVA_PT_emitter, NOVA_PT_collider, NOVA_PT_force, NOVA_PT_lightning, NOVA_MT_add)
+           NOVA_PT_display, NOVA_PT_emitter, NOVA_PT_collider, NOVA_PT_force, NOVA_PT_lightning, NOVA_UL_drives,
+           NOVA_PT_music, NOVA_MT_add)
