@@ -206,7 +206,11 @@ class NovaEmitter(bpy.types.PropertyGroup):
         ("SPHERE", "Sphere", "From inside a sphere around the origin"),
         ("SURFACE", "Surface", "From the mesh surface (area weighted)"),
         ("VERTS", "Vertices", "From mesh vertices"),
+        ("DISSOLVE", "Dissolve Front", "Where a disintegrating object burns away: Rate = particles per square "
+                                       "metre that disappears"),
     ], default="POINT")
+    dissolve_source: PointerProperty(name="Burning Object", type=bpy.types.Object,
+                                     description="The disintegrating object (empty = this object)")
     radius: FloatProperty(name="Radius", default=0.1, min=0, soft_max=10, unit="LENGTH")
     deforming: BoolProperty(name="Deforming", default=False, description="Re-read the mesh every frame")
     rate: FloatProperty(name="Rate", default=500, min=0, soft_max=100000,

@@ -6,7 +6,7 @@ import bmesh
 import bpy
 from mathutils import Euler, Matrix, Vector
 
-from . import lightning, render, sim
+from . import dissolve, lightning, render, sim
 from .params import chem
 
 # ------------------------------------------------------------------ building blocks
@@ -546,6 +546,58 @@ def build_formation(context, coll):
     return s
 
 
+def burn_particles(context, coll, ob, name=None):
+    """A Nova system with embers and ash coming off a disintegrating object's front."""
+    s = new_system(context, coll, name or f"{ob.name} Burn", [
+        bb("Ember", 1800, (0.8, 1.8), (0.004, 0.0015), 16, temp_var=250, cool=0.6, cool_rad=0.3, gravity=0.0,
+           buoyancy=3.5, drag_lin=1.5, turb=1.0, fluid_drag=2.0, twinkle_freq=6, twinkle_amt=0.5, fade_out=0.4),
+        dict(name="Ash", color_mode="GRADIENT", color=(0.05, 0.045, 0.04), color2=(0.012, 0.011, 0.01),
+             color_var=0.3, life_min=2.0, life_max=4.0, size_start=0.006, size_end=0.004, size_var=0.5,
+             gravity=-0.08, drag_lin=2.5, turb=1.4, fluid_drag=2.0, emit=0.0, fade_in=0.0,
+             fade_out=0.5, collide="NONE"),
+    ], turb_amp=1.6, turb_freq=1.8, turb_speed=0.8, wind=(0.15, 0, 0), substeps=2, shading="LIT")
+    s.nova.frame_start = context.scene.frame_start
+    # embers leave upward (hot air), ash peels off the surface
+    for kind, density, direction, speed, spread in (("Ember", 1200.0, "OBJECT_Z", 0.8, 1.1),
+                                                    ("Ash", 2500.0, "NORMAL", 0.2, 0.6)):
+        emitter(coll, s, f"{ob.name} {kind}", kind, ob.location.copy(), display="PLAIN_AXES", size=0.1,
+                shape="DISSOLVE", dissolve_source=ob, rate=density, direction=direction, speed=speed,
+                speed_var=0.6, spread=spread, frame_start=context.scene.frame_start)
+    return s
+
+
+def build_disintegrate(context, coll):
+    """A monkey head burns away from the bottom up: glowing ragged edge, char, embers and ash."""
+    me = bpy.data.meshes.new("Burning Monkey")
+    bm = bmesh.new()
+    bmesh.ops.create_monkey(bm)
+    for f in bm.faces:
+        f.smooth = True
+    bm.to_mesh(me)
+    bm.free()
+    ob = bpy.data.objects.new("Burning Monkey", me)
+    ob.location = (0, 0, 1.0)
+    coll.objects.link(ob)
+    sub = ob.modifiers.new("Subdivision", "SUBSURF")
+    sub.levels = sub.render_levels = 2
+    mat = _plain_material("Nova Monkey Paint", (0.55, 0.42, 0.3), 0.6)
+    me.materials.append(mat)
+    context.view_layer.update()
+    f0 = context.scene.frame_start
+    dissolve.setup(context, ob, (f0 + 10, f0 + 130), "PLANE")
+    ob.nova_dissolve.detail = 1
+    # a warm key from the front-left and a cool rim, so the surface reads against the dark
+    for name, kind, energy, color, loc, size in (("Nova Key", "AREA", 120.0, (1.0, 0.85, 0.7), (-2.2, -2.6, 2.6), 1.5),
+                                                 ("Nova Rim", "AREA", 80.0, (0.6, 0.75, 1.0), (2.0, 2.4, 2.2), 1.0)):
+        light = bpy.data.lights.new(name, kind)
+        light.energy, light.color, light.size = energy, color, size
+        lob = bpy.data.objects.new(name, light)
+        lob.location = loc
+        lob.rotation_euler = (Vector((0, 0, 1.1)) - Vector(loc)).to_track_quat("-Z", "Y").to_euler()
+        coll.objects.link(lob)
+    return burn_particles(context, coll, ob, name="Disintegrate")
+
+
 def build_empty(context, coll):
     s = new_system(context, coll, "Nova System", [
         dict(name="Particle", color_mode="BLACKBODY", temp0=2400, life_min=1, life_max=2, emit=20),
@@ -571,6 +623,8 @@ PRESETS = [
      build_lightning),
     ("FORMATION", "Particle Logo", "Dust assembles into a word (any text, logo or mesh), holds, then scatters",
      build_formation),
+    ("DISINTEGRATE", "Burn Away", "An object burns away along a ragged glowing front, shedding embers and ash",
+     build_disintegrate),
     ("EMPTY", "Empty System", "One type, one emitter: start from scratch", build_empty),
 ]
 
@@ -602,6 +656,7 @@ STAGES = {
     "SNOW": ((0, -14, 2.5), (0, 0, 2.5), 35, "DUSK"),
     "LIGHTNING": ((0, -95, 7), (0, 0, 23), 30, True),
     "FORMATION": ((0, -9, 1.3), (0, 0, 1.2), 35, True),
+    "DISINTEGRATE": ((0, -4.2, 1.3), (0, 0, 1.15), 45, True),
     "EMPTY": ((0, -10, 3), (0, 0, 2), 35, False),
 }
 
