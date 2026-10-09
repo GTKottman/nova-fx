@@ -289,6 +289,36 @@ def test_shape_burst():
           f"{scale:.2f} m for speed/drag = 4 m")
 
 
+
+def test_upres():
+    """Fine detail that still averages to the fluid."""
+    res = (48, 48, 72)
+    f = core.Fluid(res, 0.05, (-1.2, -1.2, 0))
+    f.set_params(dict(vorticity=0.4, turb_amp=2.0))
+    up = core.Upres(f, 2)
+    times = []
+    for i in range(40):
+        f.splat([[0, 0, 0.3]], 0.25, dens=1, heat=1.5, fuel=1.0, mode=1)
+        f.step(1 / 24)
+        up.step(1 / 24, strength=1.0, wavelength=2.0)
+        times.append(up.ms())
+    nx, ny, nz, i0, j0, k0 = up.box()
+    assert i0 % 2 == 0 and nx % 2 == 0
+    d = up.field(0)
+    coarse = f.field(0)[k0 // 2:(k0 + nz) // 2, j0 // 2:(j0 + ny) // 2, i0 // 2:(i0 + nx) // 2]
+    avg = d.reshape(nz // 2, 2, ny // 2, 2, nx // 2, 2).mean(axis=(1, 3, 5))
+    err = np.abs(avg - coarse).max() / coarse.max()
+    # detail: small-scale energy (fine minus its own 2x2x2 average) vs what plain upsampling would give (0)
+    det = d - np.repeat(np.repeat(np.repeat(avg, 2, 0), 2, 1), 2, 2)
+    grad_fine = np.abs(np.diff(d, axis=2)).mean()
+    up_lin = np.repeat(np.repeat(np.repeat(coarse, 2, 0), 2, 1), 2, 2)
+    grad_lin = np.abs(np.diff(up_lin, axis=2)).mean() / 2  # a trilinear upsample has about half the steps
+    assert err < 0.08 and np.isfinite(d).all() and d.min() >= 0, err
+    assert np.abs(det).mean() > 0.05 * coarse.mean() and grad_fine > 1.3 * grad_lin, (np.abs(det).mean(), grad_fine, grad_lin)
+    print(f"upres 2x: box {nx}x{ny}x{nz} fine cells, coarse average within {err * 100:.1f}% of the fluid, "
+          f"detail {grad_fine / grad_lin:.1f}x the gradients of plain upsampling, {np.median(times):.0f} ms/frame")
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and (len(sys.argv) < 2 or name in sys.argv[1:]):

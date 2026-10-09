@@ -116,6 +116,17 @@ def _fluid_annotations():
     ann["resolution"] = IntProperty(name="Resolution", default=96, min=16, max=512,
                                     description="Cells along the longest side of the domain")
     ann["volume"] = PointerProperty(name="Volume Object", type=bpy.types.Object)
+    ann["upres"] = IntProperty(name="Upres", default=1, min=1, max=4,
+                               description="Write the fire and smoke this many times finer than the simulation: "
+                                           "detail advected by the flow plus turbulence, held to the simulation "
+                                           "at its own scale. 1 = off. Memory and time grow with the cube")
+    ann["upres_strength"] = FloatProperty(name="Detail", default=1.0, min=0, soft_max=4,
+                                          description="Turbulence added at the fine scale, relative to the local "
+                                                      "gas speed")
+    ann["upres_scale"] = FloatProperty(name="Detail Size", default=2.0, min=0.25, soft_max=8,
+                                       description="Size of the added swirls, in simulation cells")
+    ann["upres_speed"] = FloatProperty(name="Detail Speed", default=0.5, min=0, soft_max=5,
+                                       description="How fast the added turbulence changes")
     ann["write_velocity"] = BoolProperty(name="Velocity Grid", default=False,
                                          description="Also write velocity to the VDB (volume motion blur, bigger files)")
     ann["density_mult"] = FloatProperty(name="Smoke Density", default=6.0, min=0, soft_max=100,
