@@ -287,7 +287,9 @@ def sync_display(sysob):
         rob.hide_render = rob.hide_viewport = n.display != "RIBBONS"
         if not rob.data.materials:
             rob.data.materials.append(mat)
-    lines = streaks or (n.display == "RIBBONS" and not n.ribbon_heads)
+    from . import shapes_display
+    shapes_display.sync(sysob)
+    lines = streaks or (n.display == "RIBBONS" and not n.ribbon_heads) or n.display == "SHAPES"
     # the points stay selectable (panels live on them) but show as a box while streaks or ribbons draw
     sysob.hide_render = lines
     sysob.display_type = "BOUNDS" if lines else "TEXTURED"

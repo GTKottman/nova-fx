@@ -221,7 +221,7 @@ def ensure_sdf(rt, ob, depsgraph, frame):
 
 def collider_records(rt, scene, dt, depsgraph=None, frame=0):
     recs = []
-    shapes = {"PLANE": 0, "SPHERE": 1, "BOX": 2, "MESH": 3}
+    shapes = {"PLANE": 0, "SPHERE": 1, "BOX": 2, "MESH": 3, "SHELL": 4}
     for ob in scene.objects:
         c = ob.nova_collider
         if not c.enabled or ob.hide_get() and ob.hide_render:
@@ -241,7 +241,7 @@ def collider_records(rt, scene, dt, depsgraph=None, frame=0):
         elif c.shape == "PLANE":
             local = mw @ Matrix.Translation((0, 0, center[2]))
             ext = (0, 0, 0)
-        elif c.shape == "SPHERE":
+        elif c.shape in {"SPHERE", "SHELL"}:
             local = mw @ Matrix.Translation(tuple(center))
             ext = (float(half.max()), 0, 0)
         else:

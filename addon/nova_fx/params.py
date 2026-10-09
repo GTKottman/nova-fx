@@ -26,7 +26,7 @@ COLLIDE = [
     ("NONE", "Pass Through", "Ignore colliders"),
     ("BOUNCE", "Bounce", "Bounce off colliders"),
     ("DIE", "Die", "Die on contact"),
-    ("STICK", "Stick", "Stop and slide on contact"),
+    ("STICK", "Stick", "Stop where it lands and stay there (settled snow, fallen leaves)"),
 ]
 
 # (name, type, default, options). Types: F float, I int, B bool, E enum, K particle-type reference,

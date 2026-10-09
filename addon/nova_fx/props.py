@@ -26,9 +26,24 @@ def _rename_kind(self, context):
     self["_prev_name"] = self.name
 
 
+def _shape_update(self, context):
+    from . import shapes_display
+    shapes_display.sync(self.id_data)
+
+
 def _kind_annotations():
+    from .shapes_display import ALIGN
     ann = {"name": StringProperty(name="Name", default="Type", update=_rename_kind),
-           "ui_open": StringProperty(default="life,color")}
+           "ui_open": StringProperty(default="life,color"),
+           # Shapes display (drawing only, not simulation)
+           "shape_object": PointerProperty(name="Shape", type=bpy.types.Object, update=_shape_update,
+                                           description="Shapes display: the mesh drawn for each particle of this "
+                                                       "type (about 1 unit across, scaled by the particle radius)"),
+           "shape_align": EnumProperty(name="Orientation", items=ALIGN, default="TUMBLE", update=_shape_update),
+           "shape_spin": FloatProperty(name="Tumble", default=6.0, min=0, soft_max=60, update=_shape_update,
+                                       description="Turns per metre travelled (radians): it stops when it lands"),
+           "shape_scale": FloatProperty(name="Shape Size", default=1.0, min=0, soft_max=20, update=_shape_update,
+                                        description="Shape size relative to the particle radius")}
     for name, t, default, o in KIND_SPEC:
         label = name.replace("_", " ").title()
         desc = o.get("desc", "")
@@ -234,6 +249,7 @@ class NovaSystem(bpy.types.PropertyGroup):
         ("POINTS", "Points", "Spheres (Cycles motion blur uses the velocity attribute)"),
         ("STREAKS", "Streaks", "Stretch each particle along its motion (works in EEVEE and Cycles)"),
         ("RIBBONS", "Light Ribbons", "Each particle draws a glowing trail through its last frames"),
+        ("SHAPES", "Shapes", "Each particle type drawn as a mesh of its own: snowflakes, petals, leaves, raindrops"),
     ], default="POINTS", update=_display_update)
     ribbon_frames: IntProperty(name="Trail Frames", default=12, min=2, max=120, update=_display_update,
                                description="How many frames back each ribbon reaches")
@@ -328,6 +344,7 @@ class NovaCollider(bpy.types.PropertyGroup):
         ("SPHERE", "Sphere", "Sphere from the object bounds"),
         ("BOX", "Box", "Box from the object bounds"),
         ("MESH", "Mesh", "The exact mesh shape (baked to a signed distance field)"),
+        ("SHELL", "Inside Sphere", "Keeps particles inside a sphere from the object bounds: a snow globe"),
     ], default="PLANE")
     sdf_res: IntProperty(name="Resolution", default=64, min=8, max=256,
                          description="Distance-field cells along the longest side")

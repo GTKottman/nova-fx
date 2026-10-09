@@ -42,6 +42,14 @@ make -C core
 | Drifting Embers | Buoyant embers in wind |
 | Energy Vortex | Vortex + attractor forces, streak display |
 | Snow | Lit flakes that settle |
+| Powder Snow | Fine dry powder drifting and swirling |
+| Wet Snow | Big six-armed crystal flakes that tumble down and lie where they land |
+| Blizzard | Snow driven sideways by a strong gusting wind |
+| Sleet | Icy pellets that fall fast, bounce and chip |
+| Snow Globe | A shaken globe: flakes swirl inside the glass and settle |
+| Rain | Streaking rain that splashes and rings a wet surface with ripples |
+| Cherry Blossoms | Petals drift and flutter on the breeze and gather on the ground |
+| Autumn Leaves | Red, orange and yellow leaves tumble down and settle |
 | Particle Logo | Dust assembles into a word (any text, logo or mesh) with the Form force, holds, then scatters |
 | Splash Tank | FLIP liquid: a column of water falls, wraps around a ball and sloshes in a tank |
 | Honey Pour | Thick honey poured onto a plate: the stream buckles and coils as it lands |
@@ -239,6 +247,22 @@ music triggers and events.
   Bake skips the surface and it is meshed for display. Blender 5.2 crashes meshing zero points, so the
   tree only meshes when there are some.
 - **Example:** [`examples/splash_tank.py`](examples/splash_tank.py).
+
+### Weather: shapes for every particle
+- **Shapes display:** every particle type can be drawn as a mesh of its own, instanced on its particles by
+  Geometry Nodes on a companion object. Shapes are scaled by the particle radius and carry its colour as the
+  instancer attribute `Cd`, so one leaf mesh can be red, orange and yellow. Orientation per type:
+  - *Tumble*: random, and turning with the distance travelled, so a leaf that lands stops turning.
+  - *Along Motion*: raindrops.
+  - *Flat*: ripples.
+  - *Upright*.
+- **Procedural shapes:** a six-armed dendrite snowflake, a notched cherry petal, a folded leaf, a raindrop
+  streak, a ripple ring and an ice pellet.
+- **Stick now means stick:** a particle that touches a collider with *Stick* stays where it landed, flagged in a
+  spare bit of its generation counter. Before, wind kept sliding settled snow and leaves along the ground.
+- **Inside Sphere** collider: keeps particles inside a sphere (a snow globe).
+- **Rain chain:** drops die on impact into splashes, which crown up and fall back; splashes that land leave
+  ripples that grow and fade, flat on the surface.
 
 ### Magic: ribbons, portals, spirits
 - **Light ribbons** (Display → *Light Ribbons*): each particle draws a glowing trail through where it was over the
@@ -479,6 +503,7 @@ Same plume, empty domain grown from 64³ to 256³ (old → now):
 python3 tests/test_core.py                                     # core: correctness + speed, ~7 s
 blender -b --factory-startup --python tests/blender_presets.py -- --frames 24
 blender -b --factory-startup --python tests/blender_lightning.py   # bolt controls, target, timeline
+blender -b --factory-startup --python tests/blender_weather.py    # shapes per type, landed leaves still, globe, rain chain
 blender -b --factory-startup --python tests/blender_magic.py      # ribbons follow real paths, tangent sparks, spirit look
 blender -b --factory-startup --python tests/blender_viscous.py    # nozzle, thin honey stream, looks, melting under a lamp
 blender -b --factory-startup --python tests/blender_liquid.py     # FLIP tank: kept, inside, around the ball, meshed
